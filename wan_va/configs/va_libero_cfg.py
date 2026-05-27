@@ -7,7 +7,7 @@ va_libero_cfg = EasyDict(__name__='Config: VA libero')
 va_libero_cfg.update(va_shared_cfg)
 va_shared_cfg.infer_mode = 'server'
 
-va_libero_cfg.wan22_pretrained_model_name_or_path = "/path/to/pretrained/model"
+va_libero_cfg.wan22_pretrained_model_name_or_path = "/mnt/public/xieruiqi/models/lingbot-va/libero-long"
 
 va_libero_cfg.attn_window = 30
 va_libero_cfg.frame_chunk_size = 4
@@ -20,12 +20,12 @@ va_libero_cfg.action_per_frame = 4
 va_libero_cfg.obs_cam_keys = [
     'observation.images.agentview_rgb', 'observation.images.eye_in_hand_rgb'
 ]
-va_libero_cfg.guidance_scale = 5
+va_libero_cfg.guidance_scale = 1
 va_libero_cfg.action_guidance_scale = 1
 
-va_libero_cfg.num_inference_steps = 20
+va_libero_cfg.num_inference_steps = 5
 va_libero_cfg.video_exec_step = -1
-va_libero_cfg.action_num_inference_steps = 50
+va_libero_cfg.action_num_inference_steps = 10
 
 va_libero_cfg.snr_shift = 5.0
 va_libero_cfg.action_snr_shift = 0.05

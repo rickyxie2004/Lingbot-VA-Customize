@@ -13,3 +13,7 @@ va_shared_cfg.save_root = './train_out'
 va_shared_cfg.patch_size = (1, 2, 2)
 
 va_shared_cfg.enable_offload = False
+
+va_shared_cfg.profile_action_latency = False
+va_shared_cfg.profile_action_latency_steps = False
+va_shared_cfg.return_pred_video = False

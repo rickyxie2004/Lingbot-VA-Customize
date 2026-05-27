@@ -20,6 +20,13 @@ train_config_name=0
 model_name=0
 seed=0
 PORT=29056
+SERVER_HOST=${SERVER_HOST:-127.0.0.1}
+PRINT_ACTION_PROFILE=${PRINT_ACTION_PROFILE:-0}
+PROFILE_ARGS=()
+
+if [[ "$PRINT_ACTION_PROFILE" == "1" ]]; then
+    PROFILE_ARGS+=(--print_profile True)
+fi
 
 PYTHONWARNINGS=ignore::UserWarning \
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python -m evaluation.robotwin.eval_polict_client_openpi --config policy/$policy_name/deploy_policy.yml \
@@ -35,6 +42,8 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python -m evaluation.robotwin.eval_polict_cli
     --video_guidance_scale 5 \
     --action_guidance_scale 1 \
     --test_num 100 \
-    --port ${PORT}
+    --port ${PORT} \
+    --host ${SERVER_HOST} \
+    "${PROFILE_ARGS[@]}"
 
 

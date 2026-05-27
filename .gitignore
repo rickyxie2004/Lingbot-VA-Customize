@@ -1,1 +1,4 @@
 *.pyc
+outputs/
+visualization/
+*.egg-info/

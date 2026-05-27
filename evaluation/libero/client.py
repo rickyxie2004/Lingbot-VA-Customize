@@ -74,7 +74,23 @@ def env_one_step(env_in, action):
     return _extract_obs(obs), done
 
 
-def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx):
+def _print_profile(ret, task_idx, episode_idx, infer_idx):
+    profile = ret.get('profile_action_latency') if isinstance(ret, dict) else None
+    if not profile:
+        return
+    parts = []
+    for record in profile.get('records', []):
+        suffix = f" x{record['count']}" if record.get('count', 1) > 1 else ''
+        parts.append(f"{record['name']}={record['total_ms']:.2f}ms{suffix}")
+    print(
+        f"[ActionProfile] task={task_idx} episode={episode_idx} infer={infer_idx} "
+        f"name={profile.get('name')} frame_st_id={profile.get('frame_st_id')} "
+        f"recorded_cuda={profile.get('total_recorded_cuda_ms', 0):.2f}ms | " +
+        ' | '.join(parts)
+    )
+
+
+def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx, print_profile=False):
     benchmark_dict = benchmark.get_benchmark_dict()
     benchmark_instance = benchmark_dict[libero_benchmark]()
     num_tasks = benchmark_instance.get_num_tasks()
@@ -95,8 +111,11 @@ def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx):
     full_obs_list = []
     done = False
     first = True
+    infer_idx = 0
     while cur_env.env.timestep < 800:
         ret = model.infer(dict(obs=first_obs, prompt=prompt))
+        if print_profile:
+            _print_profile(ret, task_idx, episode_idx, infer_idx)
         action = ret['action']
 
         key_frame_list = []
@@ -121,7 +140,11 @@ def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx):
         if done:
             break
         else:
-            model.infer(dict(obs=key_frame_list, compute_kv_cache=True, imagine=False, state=action))
+            infer_idx += 1
+            ret = model.infer(dict(obs=key_frame_list, compute_kv_cache=True, imagine=False, state=action))
+            if print_profile:
+                _print_profile(ret, task_idx, episode_idx, infer_idx)
+            infer_idx += 1
 
     out_file = Path(out_dir) / libero_benchmark / f"{task_idx}_{prompt.replace(' ', '_')}" / f"{episode_idx}_{done}.mp4"
     out_file.parent.mkdir(exist_ok=True, parents=True)
@@ -137,7 +160,7 @@ def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx):
     return done
 
 
-def run(libero_benchmark, port, out_dir, test_num, task_range=None):
+def run(libero_benchmark, port, out_dir, test_num, task_range=None, host="127.0.0.1", print_profile=False):
     '''
         task_range: [start, end) for splitting tasks
     '''
@@ -152,7 +175,8 @@ def run(libero_benchmark, port, out_dir, test_num, task_range=None):
         progress_bar = tqdm(range(task_range[0], task_range[1]), total=num_tasks)
 
     print(f"#################### Use benchmark: {libero_benchmark}, num_tasks: {num_tasks} #############")
-    model = WebsocketClientPolicy(port=port)
+    print(f"#################### Connect policy server: {host}:{port} #############")
+    model = WebsocketClientPolicy(host=host, port=port)
 
     video_save_root_dict = None
 
@@ -162,23 +186,45 @@ def run(libero_benchmark, port, out_dir, test_num, task_range=None):
             video_save_list = os.listdir(os.path.join(out_dir, libero_benchmark, video_save_root_dict[task_idx]))
             video_states = [1 for file in video_save_list if file.split('_')[1].split('.')[0] == 'True']
             succ_num = float(len(video_states))
+            total_num = len(video_save_list)
             episode_list = range(len(video_save_list), test_num)
         else:
             succ_num = 0.
+            total_num = 0
 
+        out_file = Path(out_dir) / f"{libero_benchmark}_{task_idx}.json"
+        out_file.parent.mkdir(exist_ok=True, parents=True)
         for episode_idx in tqdm(episode_list, total=len(episode_list)):
-            res_i = run_one(model, libero_benchmark, task_idx, out_dir, episode_idx)
+            res_i = run_one(model, libero_benchmark, task_idx, out_dir, episode_idx, print_profile=print_profile)
             succ_num += res_i
-            succ_rate = succ_num / (episode_idx + 1)
-            print(f"Success rate: {succ_rate}, success num: {succ_num}, total num: {episode_idx + 1}")
-            out_file = Path(out_dir) / f"{libero_benchmark}_{task_idx}.json"
-            out_file.parent.mkdir(exist_ok=True, parents=True)
+            total_num = episode_idx + 1
+            succ_rate = succ_num / total_num
+            print(f"Success rate: {succ_rate}, success num: {succ_num}, total num: {total_num}")
             write_json({
-                "succ_num": succ_num,
-                "total_num": episode_idx + 1.,
-                "succ_rate": succ_rate,
+                "succ_num": float(succ_num),
+                "total_num": float(total_num),
+                "succ_rate": float(succ_rate),
+                "task_success": bool(succ_num > 0),
+                "task_all_success": bool(total_num > 0 and succ_num == total_num),
                 }, out_file
             )
+
+        succ_rate = succ_num / total_num if total_num > 0 else 0.0
+        task_success = bool(succ_num > 0)
+        task_all_success = bool(total_num > 0 and succ_num == total_num)
+        print(
+            f"#################### Task {task_idx} done: "
+            f"success={task_success}, all_success={task_all_success}, "
+            f"success_rate={succ_rate}, success_num={succ_num}, total_num={total_num} #############"
+        )
+        write_json({
+            "succ_num": float(succ_num),
+            "total_num": float(total_num),
+            "succ_rate": float(succ_rate),
+            "task_success": bool(task_success),
+            "task_all_success": bool(task_all_success),
+            }, out_file
+        )
 
 
 def main():
@@ -204,6 +250,12 @@ def main():
         help="WebSocket port",
     )
     parser.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="WebSocket server host",
+    )
+    parser.add_argument(
         "--test-num",
         type=int,
         default=50,
@@ -214,6 +266,11 @@ def main():
         type=str,
         default="outputs/libero",
         help="Output directory for results",
+    )
+    parser.add_argument(
+        "--print-profile",
+        action="store_true",
+        help="Print server-side action latency profile returned by the policy server",
     )
     args = parser.parse_args()
     run(**vars(args))

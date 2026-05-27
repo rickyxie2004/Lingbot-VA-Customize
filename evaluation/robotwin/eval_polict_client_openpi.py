@@ -6,7 +6,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
 from pathlib import Path
 
-robowin_root = Path("/path/to/your/robowin")
+robowin_root = Path("/mnt/public/ns-t-te-b905754427352261-427-bk/fs/home/xieruiqi/RoboTwin")
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
 
@@ -236,18 +236,26 @@ def save_comparison_video(real_obs_list, imagined_video, action_history, save_pa
 
         target_width = row_real.shape[1]
 
+        imagined_h = 300
         if imagined_video is not None and i < n_imagined:
             img_frame = imagined_video[i]
             if img_frame.dtype != np.uint8 and img_frame.max() <= 1.0001:
                 img_frame = (img_frame * 255).astype(np.uint8)
             elif img_frame.dtype != np.uint8:
                 img_frame = img_frame.astype(np.uint8)
+            img_frame = np.ascontiguousarray(img_frame)
 
-            h = int(img_frame.shape[0] * target_width / img_frame.shape[1])
-            row_imagined = cv2.resize(img_frame, (target_width, h))
+            scale = min(target_width / img_frame.shape[1], imagined_h / img_frame.shape[0])
+            resized_w = max(1, int(img_frame.shape[1] * scale))
+            resized_h = max(1, int(img_frame.shape[0] * scale))
+            resized = cv2.resize(img_frame, (resized_w, resized_h))
+            row_imagined = np.zeros((imagined_h, target_width, 3), dtype=np.uint8)
+            y0 = (imagined_h - resized_h) // 2
+            x0 = (target_width - resized_w) // 2
+            row_imagined[y0:y0 + resized_h, x0:x0 + resized_w] = resized
         else:
-            row_imagined = np.zeros((300, target_width, 3), dtype=np.uint8)
-            cv2.putText(row_imagined, "Coming soon", (target_width//2 - 100, 150), 
+            row_imagined = np.zeros((imagined_h, target_width, 3), dtype=np.uint8)
+            cv2.putText(row_imagined, "Coming soon", (target_width//2 - 100, imagined_h // 2), 
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (100, 100, 100), 2)
 
         row_imagined = np.ascontiguousarray(row_imagined)
@@ -397,7 +405,7 @@ def main(usr_args):
     test_num = usr_args["test_num"]
 
     
-    model = WebsocketClientPolicy(port=usr_args['port'])
+    model = WebsocketClientPolicy(host=usr_args.get('host', '127.0.0.1'), port=usr_args['port'])
 
     st_seed, suc_num = eval_policy(task_name,
                                    TASK_ENV,
@@ -409,7 +417,8 @@ def main(usr_args):
                                    instruction_type=instruction_type,
                                    save_visualization=True,
                                    video_guidance_scale=video_guidance_scale,
-                                   action_guidance_scale=action_guidance_scale)
+                                   action_guidance_scale=action_guidance_scale,
+                                   print_profile=usr_args.get('print_profile', False))
     suc_nums.append(suc_num)
 
     file_path = os.path.join(save_dir, f"_result.txt")
@@ -441,6 +450,22 @@ def add_init_pose(new_pose, init_pose):
     right_pose = add_eef_pose(new_pose[8:], init_pose[8:])
     return np.concatenate([left_pose, right_pose])
 
+
+def _print_profile(ret, episode_idx, infer_idx):
+    profile = ret.get('profile_action_latency') if isinstance(ret, dict) else None
+    if not profile:
+        return
+    parts = []
+    for record in profile.get('records', []):
+        suffix = f" x{record['count']}" if record.get('count', 1) > 1 else ''
+        parts.append(f"{record['name']}={record['total_ms']:.2f}ms{suffix}")
+    print(
+        f"[ActionProfile] episode={episode_idx} infer={infer_idx} "
+        f"name={profile.get('name')} frame_st_id={profile.get('frame_st_id')} "
+        f"recorded_cuda={profile.get('total_recorded_cuda_ms', 0):.2f}ms | " +
+        ' | '.join(parts)
+    )
+
 def eval_policy(task_name,
                 TASK_ENV,
                 args,
@@ -451,7 +476,8 @@ def eval_policy(task_name,
                 instruction_type=None,
                 save_visualization=False,
                 video_guidance_scale=5.0,
-                action_guidance_scale=5.0):
+                action_guidance_scale=5.0,
+                print_profile=False):
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
@@ -542,6 +568,7 @@ def eval_policy(task_name,
         ret = model.infer(dict(reset = True, prompt=prompt, save_visualization=save_visualization))
         
         first = True
+        infer_idx = 0
         full_obs_list = []
         gen_video_list = []
         full_action_history = []
@@ -561,6 +588,8 @@ def eval_policy(task_name,
                 first_obs = format_obs(observation, prompt)
 
             ret = model.infer(dict(obs=first_obs, prompt=prompt, save_visualization=save_visualization, video_guidance_scale=video_guidance_scale, action_guidance_scale=action_guidance_scale)) #(TASK_ENV, model, observation)
+            if print_profile:
+                _print_profile(ret, now_seed, infer_idx)
             action = ret['action']
             if 'video' in ret:
                 imagined_video = ret['video']
@@ -605,7 +634,11 @@ def eval_policy(task_name,
                     
             first = False
 
-            model.infer(dict(obs = key_frame_list, compute_kv_cache=True, imagine=False, save_visualization=save_visualization, state=action))
+            infer_idx += 1
+            ret = model.infer(dict(obs = key_frame_list, compute_kv_cache=True, imagine=False, save_visualization=save_visualization, state=action))
+            if print_profile:
+                _print_profile(ret, now_seed, infer_idx)
+            infer_idx += 1
   
             if TASK_ENV.eval_success:
                 succ = True
@@ -618,7 +651,7 @@ def eval_policy(task_name,
         out_img_file = vis_dir / video_name
         save_comparison_video(
             real_obs_list=full_obs_list,
-            imagined_video=None, #gen_video_list,
+            imagined_video=gen_video_list if gen_video_list else None,
             action_history=full_action_history,
             save_path=str(out_img_file),
             fps=15 # Suggest adjusting fps based on simulation step
@@ -663,6 +696,8 @@ def parse_args_and_config():
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--overrides", nargs=argparse.REMAINDER)
     parser.add_argument("--port", type=int, default=8000, help='remote policy socket port.')
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="remote policy socket host.")
+    parser.add_argument("--print-profile", action="store_true", help="print server-side action latency profile")
     parser.add_argument("--save_root", type=str, default="results/default_vis_path")
     parser.add_argument("--video_guidance_scale", type=float, default=5.0)
     parser.add_argument("--action_guidance_scale", type=float, default=5.0)

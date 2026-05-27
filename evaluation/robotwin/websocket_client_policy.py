@@ -13,7 +13,7 @@ class WebsocketClientPolicy:
     See WebsocketPolicyServer for a corresponding server implementation.
     """
 
-    def __init__(self, host: str = "0.0.0.0", port: Optional[int] = None, api_key: Optional[str] = None) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: Optional[int] = None, api_key: Optional[str] = None) -> None:
         self._uri = f"ws://{host}"
         if port is not None:
             self._uri += f":{port}"
@@ -39,23 +39,30 @@ class WebsocketClientPolicy:
     #             time.sleep(5)
 
     def _wait_for_server(self) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
-        logging.info(f"Waiting for server at {self._uri}...")
+        print(f"[WebsocketClient] Waiting for server at {self._uri}...", flush=True)
+        attempt = 0
         while True:
+            attempt += 1
             try:
                 headers = {"Authorization": f"Api-Key {self._api_key}"} if self._api_key else None
+                print(f"[WebsocketClient] Connect attempt {attempt}: {self._uri}", flush=True)
                 # 禁用 ping 机制，防止推理时间过长导致超时
                 conn = websockets.sync.client.connect(
                     self._uri, 
                     compression=None, 
                     max_size=None, 
                     additional_headers=headers,
+                    proxy=None,
+                    open_timeout=5,
                     ping_interval=None, 
                     close_timeout=10
                 )
-                metadata = unpackb(conn.recv())
+                print("[WebsocketClient] Connected. Waiting for server metadata...", flush=True)
+                metadata = unpackb(conn.recv(timeout=5))
+                print("[WebsocketClient] Server metadata received.", flush=True)
                 return conn, metadata
-            except (ConnectionRefusedError, Exception) as e:
-                logging.info(f"Still waiting for server... (Error: {e})")
+            except Exception as e:
+                print(f"[WebsocketClient] Still waiting for server: {type(e).__name__}: {e}", flush=True)
                 time.sleep(5)
 
     @override

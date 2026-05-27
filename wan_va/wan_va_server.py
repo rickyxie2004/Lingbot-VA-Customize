@@ -3,6 +3,7 @@ import argparse
 import os
 import sys
 import time
+from contextlib import contextmanager
 from functools import partial
 from PIL import Image
 from diffusers.video_processor import VideoProcessor
@@ -36,6 +37,63 @@ from utils import (
     run_async_server_mode,
     save_async,
 )
+
+
+class _CudaActionLatencyProfiler:
+
+    def __init__(self, enabled, device, profile_steps=False):
+        self.enabled = bool(enabled) and torch.cuda.is_available()
+        self.device = device
+        self.profile_steps = bool(profile_steps)
+        self._records = {}
+        self._order = []
+
+    @contextmanager
+    def record(self, name):
+        if not self.enabled:
+            yield
+            return
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.device(self.device):
+            start_event.record()
+            try:
+                yield
+            finally:
+                end_event.record()
+                end_event.synchronize()
+                self._add(name, start_event.elapsed_time(end_event))
+
+    def _add(self, name, elapsed_ms):
+        if name not in self._records:
+            self._records[name] = [0.0, 0]
+            self._order.append(name)
+        self._records[name][0] += float(elapsed_ms)
+        self._records[name][1] += 1
+
+    def summary(self, name, **metadata):
+        if not self.enabled:
+            return None
+        records = []
+        for record_name in self._order:
+            total_ms, count = self._records[record_name]
+            records.append({
+                'name': record_name,
+                'total_ms': round(total_ms, 3),
+                'count': count,
+                'avg_ms': round(total_ms / max(count, 1), 3),
+            })
+        total_ms = sum(
+            record['total_ms'] for record in records
+            if not record['name'].endswith('.loop')
+        )
+        return {
+            'name': name,
+            'device': str(self.device),
+            'total_recorded_cuda_ms': round(total_ms, 3),
+            'records': records,
+            **metadata,
+        }
 
 
 class VA_Server:
@@ -440,26 +498,49 @@ class VA_Server:
         os.makedirs(self.exp_save_root, exist_ok=True)
         torch.cuda.empty_cache()
 
+    def _new_latency_profiler(self):
+        return _CudaActionLatencyProfiler(
+            getattr(self.job_config, 'profile_action_latency', False),
+            self.device,
+            getattr(self.job_config, 'profile_action_latency_steps', False),
+        )
+
+    def _log_latency_profile(self, profile):
+        if not profile:
+            return
+        parts = []
+        for record in profile['records']:
+            suffix = f" x{record['count']}" if record['count'] > 1 else ''
+            parts.append(f"{record['name']}={record['total_ms']:.2f}ms{suffix}")
+        logger.info(
+            f"[ActionProfile] {profile['name']} frame_st_id={profile.get('frame_st_id')} "
+            f"recorded_cuda={profile['total_recorded_cuda_ms']:.2f}ms | " +
+            ' | '.join(parts)
+        )
+
     def _infer(self, obs, frame_st_id=0):
+        profiler = self._new_latency_profiler()
         frame_chunk_size = self.job_config.frame_chunk_size
         if frame_st_id == 0:
-            init_latent = self._encode_obs(obs)
+            with profiler.record('obs.encode'):
+                init_latent = self._encode_obs(obs)
             self.init_latent = init_latent
 
-        latents = torch.randn(1,
-                              48,
-                              frame_chunk_size,
-                              self.latent_height,
-                              self.latent_width,
-                              device=self.device,
-                              dtype=self.dtype)
-        actions = torch.randn(1,
-                              self.job_config.action_dim,
-                              frame_chunk_size,
-                              self.action_per_frame,
-                              1,
-                              device=self.device,
-                              dtype=self.dtype)
+        with profiler.record('noise.init'):
+            latents = torch.randn(1,
+                                  48,
+                                  frame_chunk_size,
+                                  self.latent_height,
+                                  self.latent_width,
+                                  device=self.device,
+                                  dtype=self.dtype)
+            actions = torch.randn(1,
+                                  self.job_config.action_dim,
+                                  frame_chunk_size,
+                                  self.action_per_frame,
+                                  1,
+                                  device=self.device,
+                                  dtype=self.dtype)
 
         video_inference_step = self.job_config.num_inference_steps
         action_inference_step = self.job_config.action_num_inference_steps
@@ -486,122 +567,151 @@ class VA_Server:
                 torch.no_grad(),
         ):
             # 1. Video Generation Loop
-            for i, t in enumerate(tqdm(timesteps)):
-                last_step = i == len(timesteps) - 1
-                latent_cond = init_latent[:, :, 0:1].to(
-                    self.dtype) if frame_st_id == 0 else None
-                input_dict = self._prepare_latent_input(
-                    latents,
-                    None,
-                    t,
-                    t,
-                    latent_cond,
-                    None,
-                    frame_st_id=frame_st_id)
+            with profiler.record('video.loop'):
+                for i, t in enumerate(tqdm(timesteps)):
+                    step_suffix = f'.step_{i:02d}' if profiler.profile_steps else ''
+                    last_step = i == len(timesteps) - 1
+                    latent_cond = init_latent[:, :, 0:1].to(
+                        self.dtype) if frame_st_id == 0 else None
+                    with profiler.record(f'video.prepare_input{step_suffix}'):
+                        input_dict = self._prepare_latent_input(
+                            latents,
+                            None,
+                            t,
+                            t,
+                            latent_cond,
+                            None,
+                            frame_st_id=frame_st_id)
 
-                video_noise_pred = self.transformer(
-                    self._repeat_input_for_cfg(input_dict['latent_res_lst']),
-                    update_cache=1 if last_step else 0,
-                    cache_name=self.cache_name,
-                    action_mode=False)
+                    with profiler.record(f'video.transformer{step_suffix}'):
+                        video_noise_pred = self.transformer(
+                            self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+                            update_cache=1 if last_step else 0,
+                            cache_name=self.cache_name,
+                            action_mode=False)
 
-                if not last_step or video_step != -1:
-                    video_noise_pred = data_seq_to_patch(
-                        self.job_config.patch_size, video_noise_pred,
-                        frame_chunk_size, self.latent_height,
-                        self.latent_width, batch_size=2 if self.use_cfg else 1)
-                    if self.job_config.guidance_scale > 1:
-                        video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (video_noise_pred[:1] - video_noise_pred[1:])
-                    else:
-                        video_noise_pred = video_noise_pred[:1]
-                    latents = self.scheduler.step(video_noise_pred,
-                                                  t,
-                                                  latents,
-                                                  return_dict=False)
+                    if not last_step or video_step != -1:
+                        with profiler.record(f'video.scheduler_step{step_suffix}'):
+                            video_noise_pred = data_seq_to_patch(
+                                self.job_config.patch_size, video_noise_pred,
+                                frame_chunk_size, self.latent_height,
+                                self.latent_width, batch_size=2 if self.use_cfg else 1)
+                            if self.job_config.guidance_scale > 1:
+                                video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (video_noise_pred[:1] - video_noise_pred[1:])
+                            else:
+                                video_noise_pred = video_noise_pred[:1]
+                            latents = self.scheduler.step(video_noise_pred,
+                                                          t,
+                                                          latents,
+                                                          return_dict=False)
 
-                latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
+                    latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
 
-            for i, t in enumerate(tqdm(action_timesteps)):
-                last_step = i == len(action_timesteps) - 1
-                action_cond = torch.zeros(
-                    [
-                        1, self.job_config.action_dim, 1,
-                        self.action_per_frame, 1
-                    ],
-                    device=self.device,
-                    dtype=self.dtype) if frame_st_id == 0 else None
+            with profiler.record('action.loop'):
+                for i, t in enumerate(tqdm(action_timesteps)):
+                    step_suffix = f'.step_{i:02d}' if profiler.profile_steps else ''
+                    last_step = i == len(action_timesteps) - 1
+                    action_cond = torch.zeros(
+                        [
+                            1, self.job_config.action_dim, 1,
+                            self.action_per_frame, 1
+                        ],
+                        device=self.device,
+                        dtype=self.dtype) if frame_st_id == 0 else None
 
-                input_dict = self._prepare_latent_input(
-                    None,
-                    actions,
-                    t,
-                    t,
-                    None,
-                    action_cond,
-                    frame_st_id=frame_st_id)
-                action_noise_pred = self.transformer(
-                    self._repeat_input_for_cfg(input_dict['action_res_lst']),
-                    update_cache=1 if last_step else 0,
-                    cache_name=self.cache_name,
-                    action_mode=True)
+                    with profiler.record(f'action.prepare_input{step_suffix}'):
+                        input_dict = self._prepare_latent_input(
+                            None,
+                            actions,
+                            t,
+                            t,
+                            None,
+                            action_cond,
+                            frame_st_id=frame_st_id)
+                    with profiler.record(f'action.transformer{step_suffix}'):
+                        action_noise_pred = self.transformer(
+                            self._repeat_input_for_cfg(input_dict['action_res_lst']),
+                            update_cache=1 if last_step else 0,
+                            cache_name=self.cache_name,
+                            action_mode=True)
 
-                if not last_step:
-                    action_noise_pred = rearrange(action_noise_pred,
-                                                  'b (f n) c -> b c f n 1',
-                                                  f=frame_chunk_size)
-                    if self.job_config.action_guidance_scale > 1:
-                        action_noise_pred = action_noise_pred[1:] + self.job_config.action_guidance_scale * (action_noise_pred[:1] - action_noise_pred[1:])
-                    else:
-                        action_noise_pred = action_noise_pred[:1]
-                    actions = self.action_scheduler.step(action_noise_pred,
-                                                         t,
-                                                         actions,
-                                                         return_dict=False)
+                    if not last_step:
+                        with profiler.record(f'action.scheduler_step{step_suffix}'):
+                            action_noise_pred = rearrange(action_noise_pred,
+                                                          'b (f n) c -> b c f n 1',
+                                                          f=frame_chunk_size)
+                            if self.job_config.action_guidance_scale > 1:
+                                action_noise_pred = action_noise_pred[1:] + self.job_config.action_guidance_scale * (action_noise_pred[:1] - action_noise_pred[1:])
+                            else:
+                                action_noise_pred = action_noise_pred[:1]
+                            actions = self.action_scheduler.step(action_noise_pred,
+                                                                 t,
+                                                                 actions,
+                                                                 return_dict=False)
 
-                actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
+                    actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
 
-        actions[:, ~self.action_mask] *= 0
+        with profiler.record('action.mask'):
+            actions[:, ~self.action_mask] *= 0
 
         save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
         save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
 
-        actions = self.postprocess_action(actions)
-        torch.cuda.empty_cache()
-        return actions, latents
+        with profiler.record('action.postprocess'):
+            actions = self.postprocess_action(actions)
+        pred_video = None
+        with profiler.record('video.decode'):
+            pred_video = self._decode_pred_video(latents)
+        with profiler.record('cuda.empty_cache'):
+            torch.cuda.empty_cache()
+
+        profile = profiler.summary('action_generation', frame_st_id=frame_st_id)
+        self._log_latency_profile(profile)
+        return actions, latents, profile, pred_video
 
     def _compute_kv_cache(self, obs):
+        profiler = self._new_latency_profiler()
         ### optional async save obs for debug
         self.transformer.clear_pred_cache(self.cache_name)
         save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
-        latent_model_input = self._encode_obs(obs)
+        with profiler.record('kv.obs_encode'):
+            latent_model_input = self._encode_obs(obs)
         if self.frame_st_id == 0:
             latent_model_input = torch.cat(
                 [self.init_latent, latent_model_input],
                 dim=2) if latent_model_input is not None else self.init_latent
 
-        action_model_input = self.preprocess_action(obs['state'])
-        action_model_input = action_model_input.to(latent_model_input)
+        with profiler.record('kv.preprocess_action'):
+            action_model_input = self.preprocess_action(obs['state'])
+            action_model_input = action_model_input.to(latent_model_input)
         logger.info(
             f"get KV cache obs: {latent_model_input.shape} {action_model_input.shape}"
         )
-        input_dict = self._prepare_latent_input(latent_model_input,
-                                                action_model_input,
-                                                frame_st_id=self.frame_st_id)
+        with profiler.record('kv.prepare_input'):
+            input_dict = self._prepare_latent_input(latent_model_input,
+                                                    action_model_input,
+                                                    frame_st_id=self.frame_st_id)
 
         with (
                 torch.no_grad(),
         ):
-            self.transformer(self._repeat_input_for_cfg(input_dict['latent_res_lst']),
-                             update_cache=2,
-                             cache_name=self.cache_name,
-                             action_mode=False)
+            with profiler.record('kv.video_transformer'):
+                self.transformer(self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+                                 update_cache=2,
+                                 cache_name=self.cache_name,
+                                 action_mode=False)
 
-            self.transformer(self._repeat_input_for_cfg(input_dict['action_res_lst']),
-                             update_cache=2,
-                             cache_name=self.cache_name,
-                             action_mode=True)
-        torch.cuda.empty_cache()
+            with profiler.record('kv.action_transformer'):
+                self.transformer(self._repeat_input_for_cfg(input_dict['action_res_lst']),
+                                 update_cache=2,
+                                 cache_name=self.cache_name,
+                                 action_mode=True)
+        with profiler.record('cuda.empty_cache'):
+            torch.cuda.empty_cache()
+        profile = profiler.summary('kv_cache', frame_st_id=self.frame_st_id)
+        self._log_latency_profile(profile)
         self.frame_st_id += latent_model_input.shape[2]
+        return profile
 
     @torch.no_grad()
     def infer(self, obs):
@@ -616,15 +726,31 @@ class VA_Server:
         elif compute_kv_cache:
             logger.info(
                 f"################# Compute KV Cache #################")
-            self._compute_kv_cache(obs)
-            return dict()
+            profile = self._compute_kv_cache(obs)
+            result = dict()
+            if profile:
+                result['profile_action_latency'] = profile
+            return result
         else:
             logger.info(f"################# Infer One Chunk #################")
-            action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
-            return dict(action=action)
+            action, _, profile, pred_video = self._infer(obs, frame_st_id=self.frame_st_id)
+            result = dict(action=action)
+            if pred_video is not None:
+                result['video'] = pred_video
+            if profile:
+                result['profile_action_latency'] = profile
+            return result
     
+    def _decode_pred_video(self, latents):
+        if not getattr(self.job_config, 'return_pred_video', False):
+            return None
+        if not hasattr(self, 'video_processor'):
+            self.video_processor = VideoProcessor(vae_scale_factor=1)
+        return self.decode_one_video(latents, 'np')[0]
+
     def decode_one_video(self, latents, output_type):
-        latents = latents.to(self.vae.dtype)
+        vae_device = next(self.vae.parameters()).device
+        latents = latents.to(device=vae_device, dtype=self.vae.dtype)
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)
             .view(1, self.vae.config.z_dim, 1, 1, 1)
@@ -652,7 +778,7 @@ class VA_Server:
         pred_latent_lst = []
         pred_action_lst = []
         for chunk_id in range(self.job_config.num_chunks_to_infer):
-            actions, latents = self._infer(init_obs, frame_st_id=(chunk_id * self.job_config.frame_chunk_size))
+            actions, latents, _, _ = self._infer(init_obs, frame_st_id=(chunk_id * self.job_config.frame_chunk_size))
             actions = torch.from_numpy(actions)
             pred_latent_lst.append(latents)
             pred_action_lst.append(actions)
@@ -680,6 +806,13 @@ def run(args):
     port = config.port if args.port is None else args.port
     if args.save_root is not None:
         config.save_root = args.save_root
+    if getattr(args, 'profile_action_latency', False):
+        config.profile_action_latency = True
+    if getattr(args, 'profile_action_latency_steps', False):
+        config.profile_action_latency = True
+        config.profile_action_latency_steps = True
+    if getattr(args, 'return_pred_video', False):
+        config.return_pred_video = True
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -720,6 +853,21 @@ def main():
         type=str,
         default=None,
         help='save root'
+    )
+    parser.add_argument(
+        "--profile-action-latency",
+        action='store_true',
+        help='profile each server-side action generation with CUDA events'
+    )
+    parser.add_argument(
+        "--profile-action-latency-steps",
+        action='store_true',
+        help='also log per-denoising-step CUDA timings for action generation'
+    )
+    parser.add_argument(
+        "--return-pred-video",
+        action='store_true',
+        help='decode predicted video chunks and return them in websocket responses'
     )
     args = parser.parse_args()
     run(args)
