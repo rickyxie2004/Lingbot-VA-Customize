@@ -10,6 +10,8 @@ from lerobot.datasets.utils import write_json
 import os
 import imageio
 import cv2
+from concurrent.futures import ThreadPoolExecutor
+from wan_va.configs.va_libero_cfg import va_libero_cfg
 
 
 def save_video(real_obs_list, save_path, fps=15, video_names=["observation.images.agentview_rgb", "observation.images.eye_in_hand_rgb"]):
@@ -74,20 +76,37 @@ def env_one_step(env_in, action):
     return _extract_obs(obs), done
 
 
-def _print_profile(ret, task_idx, episode_idx, infer_idx):
-    profile = ret.get('profile_action_latency') if isinstance(ret, dict) else None
-    if not profile:
-        return
+def _format_profile(profile):
     parts = []
     for record in profile.get('records', []):
         suffix = f" x{record['count']}" if record.get('count', 1) > 1 else ''
         parts.append(f"{record['name']}={record['total_ms']:.2f}ms{suffix}")
-    print(
-        f"[ActionProfile] task={task_idx} episode={episode_idx} infer={infer_idx} "
+    return (
         f"name={profile.get('name')} frame_st_id={profile.get('frame_st_id')} "
         f"recorded_cuda={profile.get('total_recorded_cuda_ms', 0):.2f}ms | " +
         ' | '.join(parts)
     )
+
+
+def _print_profile(ret, task_idx, episode_idx, infer_idx):
+    profile = ret.get('profile_action_latency') if isinstance(ret, dict) else None
+    if not profile:
+        return
+    prefix = f"[ActionProfile] task={task_idx} episode={episode_idx} infer={infer_idx} "
+    if 'records' in profile:
+        print(prefix + _format_profile(profile))
+    else:
+        for name, sub_profile in profile.items():
+            if sub_profile:
+                print(prefix + f"{name}: " + _format_profile(sub_profile))
+
+
+def _start_async_prefetch(executor, model, current_action, feedback_obs=None, feedback_state=None):
+    payload = dict(async_prefetch=True, current_action=current_action)
+    if feedback_obs is not None and feedback_state is not None:
+        payload['feedback_obs'] = feedback_obs
+        payload['feedback_state'] = feedback_state
+    return executor.submit(model.infer, payload)
 
 
 def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx, print_profile=False):
@@ -112,39 +131,73 @@ def run_one(model, libero_benchmark, task_idx, out_dir, episode_idx, print_profi
     done = False
     first = True
     infer_idx = 0
-    while cur_env.env.timestep < 800:
-        ret = model.infer(dict(obs=first_obs, prompt=prompt))
-        if print_profile:
-            _print_profile(ret, task_idx, episode_idx, infer_idx)
-        action = ret['action']
+    async_enabled = getattr(va_libero_cfg, 'enable_async_inference', False)
+    async_executor = ThreadPoolExecutor(max_workers=1) if async_enabled else None
+    async_future = None
+    pending_feedback_obs = None
+    pending_feedback_state = None
+    current_ret = None
+    try:
+        while cur_env.env.timestep < 800:
+            if current_ret is None:
+                current_ret = model.infer(dict(obs=first_obs, prompt=prompt))
+                if print_profile:
+                    _print_profile(current_ret, task_idx, episode_idx, infer_idx)
+            action = current_ret['action']
 
-        key_frame_list = []
-        assert action.shape[2] % 4 == 0
-        action_per_frame = action.shape[2] // 4
-        start_idx = 1 if first else 0
-        for i in range(start_idx, action.shape[1]):
-            for j in range(action.shape[2]):
-                ee_action = action[:, i, j]
-                observes, done = env_one_step(cur_env, ee_action)
+            if async_enabled and not first:
+                async_future = _start_async_prefetch(
+                    async_executor,
+                    model,
+                    action,
+                    feedback_obs=pending_feedback_obs,
+                    feedback_state=pending_feedback_state)
+                pending_feedback_obs = None
+                pending_feedback_state = None
+
+            key_frame_list = []
+            assert action.shape[2] % 4 == 0
+            action_per_frame = action.shape[2] // 4
+            start_idx = 1 if first else 0
+            for i in range(start_idx, action.shape[1]):
+                for j in range(action.shape[2]):
+                    ee_action = action[:, i, j]
+                    observes, done = env_one_step(cur_env, ee_action)
+                    if done:
+                        break
+                    if (j+1) % action_per_frame == 0:
+                        full_obs_list.append(observes)
+                        key_frame_list.append(observes)
+
                 if done:
                     break
-                if (j+1) % action_per_frame == 0:
-                    full_obs_list.append(observes)
-                    key_frame_list.append(observes)
+
+            was_first = first
+            first = False
 
             if done:
                 break
 
-        first = False
-
-        if done:
-            break
-        else:
             infer_idx += 1
-            ret = model.infer(dict(obs=key_frame_list, compute_kv_cache=True, imagine=False, state=action))
-            if print_profile:
-                _print_profile(ret, task_idx, episode_idx, infer_idx)
-            infer_idx += 1
+            if async_enabled and not was_first:
+                current_ret = async_future.result()
+                async_future = None
+                if print_profile:
+                    _print_profile(current_ret, task_idx, episode_idx, infer_idx)
+                pending_feedback_obs = key_frame_list
+                pending_feedback_state = action
+                infer_idx += 1
+            else:
+                ret = model.infer(dict(obs=key_frame_list, compute_kv_cache=True, imagine=False, state=action))
+                if print_profile:
+                    _print_profile(ret, task_idx, episode_idx, infer_idx)
+                infer_idx += 1
+                current_ret = None
+    finally:
+        if async_future is not None:
+            async_future.result()
+        if async_executor is not None:
+            async_executor.shutdown(wait=True, cancel_futures=True)
 
     out_file = Path(out_dir) / libero_benchmark / f"{task_idx}_{prompt.replace(' ', '_')}" / f"{episode_idx}_{done}.mp4"
     out_file.parent.mkdir(exist_ok=True, parents=True)

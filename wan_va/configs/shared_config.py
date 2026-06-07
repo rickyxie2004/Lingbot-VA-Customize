@@ -17,3 +17,4 @@ va_shared_cfg.enable_offload = False
 va_shared_cfg.profile_action_latency = False
 va_shared_cfg.profile_action_latency_steps = False
 va_shared_cfg.return_pred_video = False
+va_shared_cfg.compile_infer = False

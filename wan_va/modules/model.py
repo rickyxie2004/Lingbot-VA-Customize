@@ -100,6 +100,7 @@ class FlexAttnFunc(nn.Module):
         window_size,
         patch_size,
         device,
+        fdm_mode=False,
     ):
         torch._inductor.config.realize_opcount_threshold = 100
         B, _, L_F, L_H, L_W = latent_shape
@@ -112,22 +113,35 @@ class FlexAttnFunc(nn.Module):
 
         latent_frame_id = torch.arange(L_F)[None, :, None, None].expand(B, -1, L_H // patch_size[1], L_W // patch_size[2])[None].flatten()
         action_frame_id = torch.arange(A_F)[None, :, None, None].expand(B, -1, A_H, A_W)[None].flatten()
-        frame_ids = torch.cat([latent_frame_id // chunk_size * 2] * 2 + [action_frame_id // chunk_size * 2 + 1] * 2)
-
-        noise_ids = torch.cat(
-            [
-                torch.zeros_like(latent_frame_id),
-                torch.ones_like(latent_frame_id),
-                torch.zeros_like(action_frame_id),
-                torch.ones_like(action_frame_id),
-            ]
-        )
+        if fdm_mode:
+            frame_ids = torch.cat([latent_frame_id] * 2 + [action_frame_id] * 2)
+            token_type_ids = torch.cat(
+                [
+                    torch.zeros_like(latent_frame_id),
+                    torch.ones_like(latent_frame_id),
+                    torch.full_like(action_frame_id, 2),
+                    torch.full_like(action_frame_id, 3),
+                ]
+            )
+        else:
+            frame_ids = torch.cat([latent_frame_id // chunk_size * 2] * 2 + [action_frame_id // chunk_size * 2 + 1] * 2)
+            token_type_ids = torch.cat(
+                [
+                    torch.zeros_like(latent_frame_id),
+                    torch.ones_like(latent_frame_id),
+                    torch.zeros_like(action_frame_id),
+                    torch.ones_like(action_frame_id),
+                ]
+            )
 
         seq_ids = F.pad(seq_ids, (0, padded_length), value=-1)
         frame_ids = F.pad(frame_ids, (0, padded_length), value=-1)
-        noise_ids = F.pad(noise_ids, (0, padded_length), value=-1)
+        token_type_ids = F.pad(token_type_ids, (0, padded_length), value=-1)
 
-        mask_mod = FlexAttnFunc._get_mask_mod(seq_ids.long().to(device), frame_ids.long().to(device), noise_ids.long().to(device), window_size)
+        if fdm_mode:
+            mask_mod = FlexAttnFunc._get_fdm_mask_mod(seq_ids.long().to(device), frame_ids.long().to(device), token_type_ids.long().to(device), window_size)
+        else:
+            mask_mod = FlexAttnFunc._get_mask_mod(seq_ids.long().to(device), frame_ids.long().to(device), token_type_ids.long().to(device), window_size)
         block_mask = FlexAttnFunc.compiled_create_block_mask(
                 mask_mod, 1, 1, len(seq_ids), len(seq_ids), device=device, _compile=True
             )
@@ -195,6 +209,79 @@ class FlexAttnFunc(nn.Module):
         mask_list.append(and_masks(clean2clean_mask, block_causal_mask))
         mask_list.append(and_masks(noise2clean_mask, block_causal_mask_exclude_self))
         mask_list.append(and_masks(noise2noise_mask, block_self_mask))
+        mask = or_masks(*mask_list)
+        mask = and_masks(mask, seq_mask)
+        mask = and_masks(mask, partial(block_window_mask, window_size=window_size))
+        return mask
+
+    @staticmethod
+    @torch.no_grad()
+    def _get_fdm_mask_mod(seq_ids, frame_ids, token_type_ids, window_size):
+        def seq_mask(
+            b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+        ):
+            return (seq_ids[q_idx] == seq_ids[kv_idx]) & (seq_ids[q_idx] >=0 ) & (seq_ids[kv_idx] >= 0)
+
+        def block_causal_mask(
+            b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+        ):
+            return (frame_ids[kv_idx] <= frame_ids[q_idx])
+
+        def block_causal_mask_exclude_self(
+            b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+        ):
+            return (frame_ids[kv_idx] < frame_ids[q_idx])
+
+        def block_self_mask(
+            b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+        ):
+            return (frame_ids[kv_idx] == frame_ids[q_idx])
+
+        def clean2clean_mask(
+            b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+        ):
+            q_clean = (token_type_ids[q_idx] == 1) | (token_type_ids[q_idx] == 3)
+            kv_clean = (token_type_ids[kv_idx] == 1) | (token_type_ids[kv_idx] == 3)
+            return q_clean & kv_clean
+
+        def video_noise2clean_mask(
+            b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+        ):
+            kv_clean = (token_type_ids[kv_idx] == 1) | (token_type_ids[kv_idx] == 3)
+            return (token_type_ids[q_idx] == 0) & kv_clean
+
+        def video_noise2noise_mask(
+            b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+        ):
+            return (token_type_ids[q_idx] == 0) & (token_type_ids[kv_idx] == 0)
+
+        def action_noise2video_clean_mask(
+            b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+        ):
+            return (token_type_ids[q_idx] == 2) & (token_type_ids[kv_idx] == 1)
+
+        def action_noise2action_clean_mask(
+            b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+        ):
+            return (token_type_ids[q_idx] == 2) & (token_type_ids[kv_idx] == 3)
+
+        def action_noise2noise_mask(
+            b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+        ):
+            return (token_type_ids[q_idx] == 2) & (token_type_ids[kv_idx] == 2)
+
+        def block_window_mask(
+            b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor, window_size: int
+        ):
+            return ((frame_ids[q_idx] - frame_ids[kv_idx]).abs() <= window_size)
+
+        mask_list = []
+        mask_list.append(and_masks(clean2clean_mask, block_causal_mask))
+        mask_list.append(and_masks(video_noise2clean_mask, block_causal_mask_exclude_self))
+        mask_list.append(and_masks(video_noise2noise_mask, block_self_mask))
+        mask_list.append(and_masks(action_noise2video_clean_mask, block_causal_mask))
+        mask_list.append(and_masks(action_noise2action_clean_mask, block_causal_mask_exclude_self))
+        mask_list.append(and_masks(action_noise2noise_mask, block_self_mask))
         mask = or_masks(*mask_list)
         mask = and_masks(mask, seq_mask)
         mask = and_masks(mask, partial(block_window_mask, window_size=window_size))
@@ -768,7 +855,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                input_dict["chunk_size"],
                                window_size=input_dict['window_size'],
                                patch_size=self.patch_size,
-                               device=hidden_states.device
+                               device=hidden_states.device,
+                               fdm_mode=input_dict.get('fdm_video_loss', False),
                                )
 
         for block in self.blocks:

@@ -7,6 +7,7 @@ va_robotwin_cfg = EasyDict(__name__='Config: VA robotwin')
 va_robotwin_cfg.update(va_shared_cfg)
 
 va_robotwin_cfg.wan22_pretrained_model_name_or_path = "/mnt/public/xieruiqi/models/lingbot-va/robotwin"
+va_robotwin_cfg.trained_transformer_path = "/mnt/public/ns-t-te-b905754427352261-427-bk/fs/home/xieruiqi/lingbot-va/train_out/checkpoints/checkpoint_step_9000"
 
 va_robotwin_cfg.attn_window = 72
 va_robotwin_cfg.frame_chunk_size = 2
@@ -23,9 +24,11 @@ va_robotwin_cfg.obs_cam_keys = [
 va_robotwin_cfg.guidance_scale = 1
 va_robotwin_cfg.action_guidance_scale = 1
 
-va_robotwin_cfg.num_inference_steps = 1
+va_robotwin_cfg.num_inference_steps = 3
 va_robotwin_cfg.video_exec_step = -1
-va_robotwin_cfg.action_num_inference_steps = 1
+va_robotwin_cfg.enable_async_inference = True
+va_robotwin_cfg.action_num_inference_steps = 3
+va_robotwin_cfg.reset_policy_at_half_eval_steps = False
 
 va_robotwin_cfg.snr_shift = 5.0
 va_robotwin_cfg.action_snr_shift = 1.0

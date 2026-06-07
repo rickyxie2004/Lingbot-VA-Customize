@@ -22,7 +22,7 @@ if [[ "$RETURN_PRED_VIDEO" == "1" ]]; then
     PROFILE_ARGS+=(--return-pred-video)
 fi
 
-python -m torch.distributed.run \
+CUDA_VISIBLE_DEVICES=0 python -m torch.distributed.run \
     --nproc_per_node 1 \
     --master_port $MASTER_PORT \
     wan_va/wan_va_server.py \

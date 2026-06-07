@@ -161,6 +161,7 @@ class LatentLeRobotDataset(LeRobotDataset):
             episode_index = value["episode_index"]
             tasks = value["tasks"]
             action_config = value["action_config"]
+            prev_valid_meta = None
             for acfg in action_config:
                 cur_meta = {
                     "episode_index": episode_index,
@@ -175,7 +176,13 @@ class LatentLeRobotDataset(LeRobotDataset):
                 )
 
                 if check_statu:
+                    cur_meta["prev_action_meta"] = prev_valid_meta
                     out.append(cur_meta)
+                    prev_valid_meta = {
+                        "episode_index": episode_index,
+                        "start_frame": cur_meta["start_frame"],
+                        "end_frame": cur_meta["end_frame"],
+                    }
         self.new_metas = out
 
     def _check_meta(self, start_frame, end_frame, episode_index):
@@ -220,6 +227,17 @@ class LatentLeRobotDataset(LeRobotDataset):
             out[key] = latent_data
         
         return self._flatten_latent_dict(out)
+
+    def _get_latent_frame_ids(self, start_frame, end_frame, episode_index):
+        episode_chunk = self.meta.get_episode_chunk(episode_index)
+        latent_path = Path(self.latent_path) / f"chunk-{episode_chunk:03d}"
+        cur_path = latent_path / self.used_video_keys[0]
+        latent_file = (
+            cur_path / f"episode_{episode_index:06d}_{start_frame}_{end_frame}.pth"
+        )
+        assert os.path.exists(latent_file)
+        latent_data = torch.load(latent_file, weights_only=False)
+        return latent_data["frame_ids"]
     
         
     def _cat_video_latents(self,
@@ -284,6 +302,18 @@ class LatentLeRobotDataset(LeRobotDataset):
         action_aligned *= action_mask_aligned
         return torch.from_numpy(action_aligned).float(), torch.from_numpy(action_mask_aligned).bool()
 
+    def _get_action_chunk(self, start_frame, end_frame, episode_index):
+        latent_frame_ids = self._get_latent_frame_ids(start_frame, end_frame, episode_index)
+        global_start_frame = self._get_global_idx(episode_index, start_frame)
+        global_end_frame = self._get_global_idx(episode_index, end_frame)
+        hf_data_frames = self._get_range_hf_data(global_start_frame, global_end_frame)
+        return self._action_post_process(
+            start_frame,
+            end_frame,
+            latent_frame_ids,
+            hf_data_frames["action"],
+        )
+
     def __getitem__(self, idx) -> dict:
         idx = idx % len(self.new_metas)
         cur_meta = self.new_metas[idx]
@@ -304,6 +334,26 @@ class LatentLeRobotDataset(LeRobotDataset):
         out_dict = self._cat_video_latents(ori_data_dict)
 
         out_dict['actions'], out_dict['actions_mask'] = self._action_post_process(local_start_frame, local_end_frame, latent_frame_ids, ori_data_dict['action'])
+
+        if getattr(self.config, 'use_prev_action_chunk_noise', False):
+            prev_meta = cur_meta.get("prev_action_meta")
+            prev_actions = torch.zeros_like(out_dict['actions'])
+            prev_actions_mask = torch.zeros_like(out_dict['actions_mask'])
+            prev_actions_valid = torch.tensor(False)
+            if prev_meta is not None:
+                prev_actions, prev_actions_mask = self._get_action_chunk(
+                    prev_meta["start_frame"],
+                    prev_meta["end_frame"],
+                    prev_meta["episode_index"],
+                )
+                if prev_actions.shape == out_dict['actions'].shape:
+                    prev_actions_valid = torch.tensor(True)
+                else:
+                    prev_actions = torch.zeros_like(out_dict['actions'])
+                    prev_actions_mask = torch.zeros_like(out_dict['actions_mask'])
+            out_dict['prev_actions'] = prev_actions
+            out_dict['prev_actions_mask'] = prev_actions_mask
+            out_dict['prev_actions_valid'] = prev_actions_valid
 
         out_dict['latents'] = out_dict['latents'].permute(3, 0, 1, 2)
         return out_dict

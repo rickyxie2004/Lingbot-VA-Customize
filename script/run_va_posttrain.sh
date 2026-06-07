@@ -16,10 +16,10 @@ if [ $# -ne 0 ]; then
     overrides="$*"
 fi
 
-export WANDB_API_KEY="your key"
-export WANDB_BASE_URL="your url"
-export WANDB_TEAM_NAME="your team name"
-export WANDB_PROJECT="your project"
+export WANDB_API_KEY="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"
+export WANDB_BASE_URL="https://api.wandb.ai"
+export WANDB_TEAM_NAME="rickyxie-tsinghua-university"
+export WANDB_PROJECT="lingbot-va"
 
 ## node setting
 num_gpu=${NGPU}

@@ -165,11 +165,23 @@ class Trainer:
         return batch
 
     @torch.no_grad()
-    def _add_noise(self, latent, train_scheduler, action_mask=False, action_mode=False, noisy_cond_prob=0.):
+    def _add_noise(self,
+                   latent,
+                   train_scheduler,
+                   action_mask=False,
+                   action_mode=False,
+                   noisy_cond_prob=0.,
+                   noise_anchor=None,
+                   noise_anchor_valid=None,
+                   anchor_noise_std=0.15):
         B, C, F, H, W = latent.shape
 
         timestep_ids = sample_timestep_id(batch_size=F, num_train_timesteps=train_scheduler.num_train_timesteps)
         noise = torch.zeros_like(latent).normal_()
+        if action_mode and noise_anchor is not None and noise_anchor_valid is not None:
+            anchor_noise = noise_anchor + anchor_noise_std * torch.zeros_like(latent).normal_()
+            anchor_valid = noise_anchor_valid.to(device=latent.device).bool().view(B, 1, 1, 1, 1)
+            noise = torch.where(anchor_valid, anchor_noise, noise)
         timesteps = train_scheduler.timesteps[timestep_ids].to(device=self.device)
         noisy_latents =train_scheduler.add_noise(latent, noise, timesteps, t_dim=2)
         targets =train_scheduler.training_target(latent, noise, timesteps)
@@ -221,19 +233,40 @@ class Trainer:
         """Prepare input dict following infer code pattern from wan_va_server.py."""
         # Generate grid_id following infer code (no batch dimension yet)
         # For action mode: get_mesh_id(shape[-3], shape[-2], shape[-1], t=1, f_w=1, f_shift, action=True)
+        use_fdm_video_loss = (
+            getattr(self.config, 'use_fdm_video_loss', False)
+            and torch.rand(1).item() < 0.5
+        )
         latent_dict = self._add_noise(
-            latent=batch_dict['latents'], 
-            train_scheduler=self.train_scheduler_latent, 
-            action_mask=None, 
+            latent=batch_dict['latents'],
+            train_scheduler=self.train_scheduler_latent,
+            action_mask=None,
             action_mode=False,
-            noisy_cond_prob=0.5)
+            noisy_cond_prob=0.0 if use_fdm_video_loss else 0.5)
+        if use_fdm_video_loss:
+            latent_loss_mask = torch.ones(
+                [batch_dict['latents'].shape[0], 1, batch_dict['latents'].shape[2], 1, 1],
+                device=batch_dict['latents'].device,
+                dtype=batch_dict['latents'].dtype,
+            )
+            latent_loss_mask[:, :, 0] = 0
+            latent_dict['latent_loss_mask'] = latent_loss_mask
         
+        action_noise_kwargs = {}
+        if getattr(self.config, 'use_prev_action_chunk_noise', False):
+            action_noise_kwargs = dict(
+                noise_anchor=batch_dict['prev_actions'],
+                noise_anchor_valid=batch_dict['prev_actions_valid'],
+                anchor_noise_std=getattr(self.config, 'prev_action_chunk_noise_std', 0.15),
+            )
+
         action_dict = self._add_noise(
             latent=batch_dict['actions'], 
             train_scheduler=self.train_scheduler_action, 
             action_mask=batch_dict['actions_mask'], 
             action_mode=True,
-            noisy_cond_prob=0.0)
+            noisy_cond_prob=0.0,
+            **action_noise_kwargs)
 
         latent_dict['text_emb'] = batch_dict['text_emb']
         action_dict['text_emb'] = batch_dict['text_emb']
@@ -242,6 +275,7 @@ class Trainer:
         input_dict = {
             'latent_dict': latent_dict,
             'action_dict': action_dict,
+            'fdm_video_loss': use_fdm_video_loss,
             'chunk_size': torch.randint(1, 5, (1,)).item(),
             'window_size': torch.randint(4, 65, (1,)).item(),
         }
@@ -267,16 +301,28 @@ class Trainer:
         latent_loss_weight = self.train_scheduler_latent.training_weight(input_dict['latent_dict']['timesteps'].flatten()).reshape(Bn, Fn)
         action_loss_weight = self.train_scheduler_action.training_weight(input_dict['action_dict']['timesteps'].flatten()).reshape(Bn, Fn)
 
-        # Frame-wise video loss calculation
+        # Frame-wise video/FDM loss calculation
         latent_loss = F.mse_loss(latent_pred.float(), input_dict['latent_dict']['targets'].float().detach(), reduction='none')
         latent_loss = latent_loss * latent_loss_weight[:, None, :, None, None]
+        latent_loss_mask = input_dict['latent_dict'].get('latent_loss_mask', None)
+        latent_element_mask = torch.ones_like(latent_loss)
+        if latent_loss_mask is not None:
+            latent_loss_mask = latent_loss_mask.to(device=latent_loss.device, dtype=latent_loss.dtype)
+            latent_loss = latent_loss * latent_loss_mask
+            latent_element_mask = latent_element_mask * latent_loss_mask
         # Permute to (B, F, H, W, C) and flatten to (B*F, H*W*C)
         latent_loss = latent_loss.permute(0, 2, 3, 4, 1)  # (B, C, F, H, W) -> (B, F, H, W, C)
+        latent_element_mask = latent_element_mask.permute(0, 2, 3, 4, 1)
         latent_loss = latent_loss.flatten(0, 1).flatten(1)  # (B, F, H, W, C) -> (B*F, H*W*C)
+        latent_element_mask = latent_element_mask.flatten(0, 1).flatten(1)
         # Sum per frame and compute mask per frame
         latent_loss_per_frame = latent_loss.sum(dim=1)  # (B*F,)
-        latent_mask_per_frame = torch.ones_like(latent_loss).sum(dim=1)  # (B*F,)
-        latent_loss = (latent_loss_per_frame / (latent_mask_per_frame + 1e-6)).mean()
+        latent_mask_per_frame = latent_element_mask.sum(dim=1)  # (B*F,)
+        valid_latent_frames = latent_mask_per_frame > 0
+        if valid_latent_frames.any():
+            latent_loss = (latent_loss_per_frame[valid_latent_frames] / (latent_mask_per_frame[valid_latent_frames] + 1e-6)).mean()
+        else:
+            latent_loss = latent_loss_per_frame.sum() * 0.0
 
         # Frame-wise action loss calculation
         action_loss = F.mse_loss(action_pred.float(), input_dict['action_dict']['targets'].float().detach(), reduction='none')
@@ -312,7 +358,12 @@ class Trainer:
 
         loss.backward()
 
-        losses = {'latent_loss': latent_loss.detach(), 'action_loss': action_loss.detach()}
+        losses = {
+            'latent_loss': latent_loss.detach(),
+            'action_loss': action_loss.detach(),
+            'latent_loss_for_log': latent_loss.detach() * self.gradient_accumulation_steps,
+            'is_fdm_video_loss': input_dict.get('fdm_video_loss', False),
+        }
         
         # Only update weights after accumulating gradients
         if should_sync:
@@ -327,6 +378,31 @@ class Trainer:
             losses['should_log'] = False
 
         return losses
+
+    def _distributed_optional_mean(self, values):
+        if values:
+            value_sum = torch.stack(values).sum()
+            value_count = torch.tensor(float(len(values)), device=value_sum.device)
+        else:
+            value_sum = torch.tensor(0.0, device=self.device)
+            value_count = torch.tensor(0.0, device=self.device)
+        if dist.is_initialized():
+            dist.all_reduce(value_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(value_count, op=dist.ReduceOp.SUM)
+        if value_count.item() == 0:
+            return None
+        return (value_sum / value_count).detach().cpu().item()
+
+    def _distributed_optional_max(self, values):
+        if values:
+            value_max = torch.stack(values).max()
+        else:
+            value_max = torch.tensor(float('-inf'), device=self.device)
+        if dist.is_initialized():
+            dist.all_reduce(value_max, op=dist.ReduceOp.MAX)
+        if value_max.item() == float('-inf'):
+            return None
+        return value_max.detach().cpu().item()
 
     def save_checkpoint(self,):
         """Save model checkpoint in the same format as pretrained model."""
@@ -436,6 +512,8 @@ class Trainer:
         self.optimizer.zero_grad()
         accumulated_latent_losses = []
         accumulated_action_losses = []
+        accumulated_video_denoise_losses = []
+        accumulated_fdm_video_losses = []
         step_in_accumulation = 0
 
         while self.step < self.config.num_steps:
@@ -447,6 +525,10 @@ class Trainer:
             # Accumulate losses for logging
             accumulated_latent_losses.append(losses['latent_loss'])
             accumulated_action_losses.append(losses['action_loss'])
+            if losses['is_fdm_video_loss']:
+                accumulated_fdm_video_losses.append(losses['latent_loss_for_log'])
+            else:
+                accumulated_video_denoise_losses.append(losses['latent_loss_for_log'])
             step_in_accumulation += 1
 
             # Log and checkpoint when optimizer steps
@@ -458,10 +540,16 @@ class Trainer:
                 action_loss_show = dist_mean(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
                 max_latent_loss_show = dist_max(torch.stack(accumulated_latent_losses).sum()).detach().cpu().item()
                 max_action_loss_show = dist_max(torch.stack(accumulated_action_losses).sum()).detach().cpu().item()
+                video_denoise_loss_show = self._distributed_optional_mean(accumulated_video_denoise_losses)
+                fdm_video_loss_show = self._distributed_optional_mean(accumulated_fdm_video_losses)
+                max_video_denoise_loss_show = self._distributed_optional_max(accumulated_video_denoise_losses)
+                max_fdm_video_loss_show = self._distributed_optional_max(accumulated_fdm_video_losses)
 
                 # Clear accumulated losses
                 accumulated_latent_losses = []
                 accumulated_action_losses = []
+                accumulated_video_denoise_losses = []
+                accumulated_fdm_video_losses = []
                 step_in_accumulation = 0
 
                 torch.cuda.synchronize()
@@ -474,20 +562,31 @@ class Trainer:
                     progress_bar.n += 1
                     progress_bar.set_postfix({
                         'latent_loss': f'{latent_loss_show:.4f}',
+                        'video_denoise': 'n/a' if video_denoise_loss_show is None else f'{video_denoise_loss_show:.4f}',
+                        'fdm_video': 'n/a' if fdm_video_loss_show is None else f'{fdm_video_loss_show:.4f}',
                         'action_loss': f'{action_loss_show:.4f}',
                         'step': self.step,
                         'grad_norm': f'{total_norm.item():.2f}',
                         'lr': f'{lr:.2e}'
                     })
                     if self.config.enable_wandb:
-                        self.wandb.log({
+                        log_dict = {
                             'loss_metrics/global_avg_video_loss': latent_loss_show,
                             'loss_metrics/global_avg_action_loss': action_loss_show,
                             'loss_metrics/global_max_video_loss': max_latent_loss_show,
                             'loss_metrics/global_max_action_loss': max_action_loss_show,
                             'grad_norm': total_norm.item(),
                             'lr': lr,
-                        }, step=self.step)
+                        }
+                        if video_denoise_loss_show is not None:
+                            log_dict['loss_metrics/global_avg_video_denoise_loss'] = video_denoise_loss_show
+                        if fdm_video_loss_show is not None:
+                            log_dict['loss_metrics/global_avg_fdm_video_loss'] = fdm_video_loss_show
+                        if max_video_denoise_loss_show is not None:
+                            log_dict['loss_metrics/global_max_video_denoise_loss'] = max_video_denoise_loss_show
+                        if max_fdm_video_loss_show is not None:
+                            log_dict['loss_metrics/global_max_fdm_video_loss'] = max_fdm_video_loss_show
+                        self.wandb.log(log_dict, step=self.step)
                 
                 self.step += 1
                 

@@ -134,9 +134,13 @@ class VA_Server:
             torch_dtype=self.dtype,
             torch_device='cpu' if self.enable_offload else self.device,
         )
-
+        transformer_base_path = getattr(job_config, 'trained_transformer_path', None)
+        if transformer_base_path is not None:
+            logger.info('Using trained transformer!')
+        else:
+            transformer_base_path = job_config.wan22_pretrained_model_name_or_path
         self.transformer = load_transformer(
-            os.path.join(job_config.wan22_pretrained_model_name_or_path,
+            os.path.join(transformer_base_path,
                          'transformer'),
             torch_dtype=self.dtype,
             torch_device=self.device,
@@ -160,6 +164,15 @@ class VA_Server:
                 torch_device='cpu' if self.enable_offload else self.device,
             )
             self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
+
+        if getattr(job_config, 'compile_infer', False):
+            logger.info("Enable torch.compile for VA_Server._infer")
+            self._infer = torch.compile(
+                self._infer,
+                dynamic=False,
+                fullgraph=False,
+                mode="max-autotune",
+            )
 
     def _get_t5_prompt_embeds(
         self,
@@ -669,6 +682,124 @@ class VA_Server:
         self._log_latency_profile(profile)
         return actions, latents, profile, pred_video
 
+    def _cache_pred_action_chunk(self, action, frame_st_id):
+        profiler = self._new_latency_profiler()
+        self.transformer.clear_pred_cache(self.cache_name)
+        with profiler.record('async.preprocess_current_action'):
+            action_model_input = self.preprocess_action(action).to(self.device).to(self.dtype)
+        with profiler.record('async.prepare_current_action'):
+            input_dict = self._prepare_latent_input(
+                None,
+                action_model_input,
+                frame_st_id=frame_st_id)
+        with torch.no_grad():
+            with profiler.record('async.cache_current_action'):
+                self.transformer(
+                    self._repeat_input_for_cfg(input_dict['action_res_lst']),
+                    update_cache=1,
+                    cache_name=self.cache_name,
+                    action_mode=True)
+        profile = profiler.summary('async_cache_current_action', frame_st_id=frame_st_id)
+        self._log_latency_profile(profile)
+        return profile
+
+    def _infer_fdm_video(self, frame_st_id):
+        profiler = self._new_latency_profiler()
+        frame_chunk_size = self.job_config.frame_chunk_size
+
+        with profiler.record('fdm.noise.init'):
+            latents = torch.randn(1,
+                                  48,
+                                  frame_chunk_size,
+                                  self.latent_height,
+                                  self.latent_width,
+                                  device=self.device,
+                                  dtype=self.dtype)
+
+        video_inference_step = self.job_config.num_inference_steps
+        video_step = self.job_config.video_exec_step
+        self.scheduler.set_timesteps(video_inference_step)
+        timesteps = F.pad(self.scheduler.timesteps, (0, 1), mode='constant', value=0)
+        if video_step != -1:
+            timesteps = timesteps[:video_step]
+
+        with torch.no_grad():
+            with profiler.record('fdm.video.loop'):
+                for i, t in enumerate(tqdm(timesteps)):
+                    step_suffix = f'.step_{i:02d}' if profiler.profile_steps else ''
+                    last_step = i == len(timesteps) - 1
+                    with profiler.record(f'fdm.video.prepare_input{step_suffix}'):
+                        input_dict = self._prepare_latent_input(
+                            latents,
+                            None,
+                            t,
+                            t,
+                            None,
+                            None,
+                            frame_st_id=frame_st_id)
+                    with profiler.record(f'fdm.video.transformer{step_suffix}'):
+                        video_noise_pred = self.transformer(
+                            self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+                            update_cache=1 if last_step else 0,
+                            cache_name=self.cache_name,
+                            action_mode=False)
+                    if not last_step or video_step != -1:
+                        with profiler.record(f'fdm.video.scheduler_step{step_suffix}'):
+                            video_noise_pred = data_seq_to_patch(
+                                self.job_config.patch_size, video_noise_pred,
+                                frame_chunk_size, self.latent_height,
+                                self.latent_width, batch_size=2 if self.use_cfg else 1)
+                            if self.job_config.guidance_scale > 1:
+                                video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (video_noise_pred[:1] - video_noise_pred[1:])
+                            else:
+                                video_noise_pred = video_noise_pred[:1]
+                            latents = self.scheduler.step(video_noise_pred,
+                                                          t,
+                                                          latents,
+                                                          return_dict=False)
+
+        save_async(latents, os.path.join(self.exp_save_root, f'fdm_latents_{frame_st_id}.pt'))
+        with profiler.record('cuda.empty_cache'):
+            torch.cuda.empty_cache()
+        profile = profiler.summary('fdm_grounding', frame_st_id=frame_st_id)
+        self._log_latency_profile(profile)
+        return latents, profile
+
+    def _async_prefetch(self, obs):
+        profiler = self._new_latency_profiler()
+        feedback_obs = obs.get('feedback_obs', None)
+        feedback_state = obs.get('feedback_state', None)
+        current_action = obs.get('current_action', None)
+        if current_action is None:
+            raise ValueError('async_prefetch requires current_action')
+
+        feedback_profile = None
+        if feedback_obs is not None and feedback_state is not None:
+            with profiler.record('async.feedback_kv_cache'):
+                feedback_profile = self._compute_kv_cache({
+                    'obs': feedback_obs,
+                    'state': feedback_state,
+                })
+        else:
+            self.transformer.clear_pred_cache(self.cache_name)
+
+        current_frame_st_id = self.frame_st_id
+        current_action_profile = self._cache_pred_action_chunk(current_action, current_frame_st_id)
+        _, fdm_profile = self._infer_fdm_video(current_frame_st_id)
+        action, _, action_profile, pred_video = self._infer(
+            obs,
+            frame_st_id=current_frame_st_id + self.job_config.frame_chunk_size)
+
+        profile = profiler.summary('async_prefetch', frame_st_id=current_frame_st_id)
+        self._log_latency_profile(profile)
+        return action, pred_video, {
+            'async_prefetch': profile,
+            'feedback_kv_cache': feedback_profile,
+            'cache_current_action': current_action_profile,
+            'fdm_grounding': fdm_profile,
+            'action_generation': action_profile,
+        }
+
     def _compute_kv_cache(self, obs):
         profiler = self._new_latency_profiler()
         ### optional async save obs for debug
@@ -718,6 +849,7 @@ class VA_Server:
         reset = obs.get('reset', False)
         prompt = obs.get('prompt', None)
         compute_kv_cache = obs.get('compute_kv_cache', False)
+        async_prefetch = obs.get('async_prefetch', False)
 
         if reset:
             logger.info(f"******************* Reset server ******************")
@@ -728,6 +860,16 @@ class VA_Server:
                 f"################# Compute KV Cache #################")
             profile = self._compute_kv_cache(obs)
             result = dict()
+            if profile:
+                result['profile_action_latency'] = profile
+            return result
+        elif async_prefetch:
+            logger.info(
+                f"################# Async Prefetch #################")
+            action, pred_video, profile = self._async_prefetch(obs)
+            result = dict(action=action)
+            if pred_video is not None:
+                result['video'] = pred_video
             if profile:
                 result['profile_action_latency'] = profile
             return result
@@ -813,6 +955,8 @@ def run(args):
         config.profile_action_latency_steps = True
     if getattr(args, 'return_pred_video', False):
         config.return_pred_video = True
+    if getattr(args, 'compile_infer', False):
+        config.compile_infer = True
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -868,6 +1012,11 @@ def main():
         "--return-pred-video",
         action='store_true',
         help='decode predicted video chunks and return them in websocket responses'
+    )
+    parser.add_argument(
+        "--compile-infer",
+        action='store_true',
+        help='enable torch.compile on VA_Server._infer for repeated-shape inference'
     )
     args = parser.parse_args()
     run(args)

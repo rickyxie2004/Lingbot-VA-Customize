@@ -25,6 +25,7 @@ va_libero_cfg.action_guidance_scale = 1
 
 va_libero_cfg.num_inference_steps = 5
 va_libero_cfg.video_exec_step = -1
+va_libero_cfg.enable_async_inference = False
 va_libero_cfg.action_num_inference_steps = 10
 
 va_libero_cfg.snr_shift = 5.0

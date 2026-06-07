@@ -6,6 +6,12 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
 from pathlib import Path
 
+lingbot_va_root = Path(__file__).resolve().parents[2]
+if str(lingbot_va_root) not in sys.path:
+    sys.path.insert(0, str(lingbot_va_root))
+
+from wan_va.configs.va_robotwin_cfg import va_robotwin_cfg
+
 robowin_root = Path("/mnt/public/ns-t-te-b905754427352261-427-bk/fs/home/xieruiqi/RoboTwin")
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
@@ -21,6 +27,7 @@ import numpy as np
 from pathlib import Path
 from collections import deque
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 
 import yaml
 from datetime import datetime
@@ -60,18 +67,18 @@ def add_title_bar(img, text, font_scale=0.8, thickness=2):
     """Add a black title bar with text above the image"""
     h, w, _ = img.shape
     bar_height = 40
-    
+
     # Create black background bar
     title_bar = np.zeros((bar_height, w, 3), dtype=np.uint8)
-    
+
     # Calculate text position to center it
     (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
     text_x = (w - text_w) // 2
     text_y = (bar_height + text_h) // 2 - 5
-    
-    cv2.putText(title_bar, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 
+
+    cv2.putText(title_bar, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX,
                 font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
-    
+
     return np.vstack([title_bar, img])
 
 def quaternion_to_euler(quat):
@@ -92,50 +99,50 @@ def visualize_action_step(action_history, step_idx, window=50):
     Subplot 2: Left arm Euler angles (Roll, Pitch, Yaw) - converted from quaternion
     Subplot 3: Right arm XYZ Position + Gripper
     Subplot 4: Right arm Euler angles (Roll, Pitch, Yaw) - converted from quaternion
-    
+
     Input data format: [left_x, left_y, left_z, left_rx, left_ry, left_rz, left_rw, left_gripper,
                    right_x, right_y, right_z, right_rx, right_ry, right_rz, right_rw, right_gripper]
     Total 16 dimensions
     """
     # Create four subplots, sharing the X-axis
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14, 8), dpi=100, sharex=True)
-    
+
     # 1. Determine slice range
     start = max(0, step_idx - window)
     end = step_idx + 1
-    
+
     # 2. Get data subset
     history_subset = np.array(action_history)[start:end]
-    
+
     # 3. Generate X-axis based on actual data length
     actual_len = len(history_subset)
     x_axis = range(start, start + actual_len)
-    
+
     if actual_len > 0 and history_subset.shape[1] >= 16:
         # Convert quaternions to Euler angles
         left_euler = []
         right_euler = []
-        
+
         for action in history_subset:
             # Left arm quaternion to Euler angles
             left_quat = action[3:7]  # [rx, ry, rz, rw]
             left_rpy = quaternion_to_euler(left_quat)
             left_euler.append(left_rpy)
-            
+
             # Right arm quaternion to Euler angles
             right_quat = action[11:15]  # [rx, ry, rz, rw]
             right_rpy = quaternion_to_euler(right_quat)
             right_euler.append(right_rpy)
-        
+
         left_euler = np.array(left_euler)
         right_euler = np.array(right_euler)
-        
+
         # --- Left Arm ---
         # Subplot 1: Left Arm Translation (XYZ) + Gripper
         ax1.plot(x_axis, history_subset[:, 0], label='left_x', color='r', linewidth=1.5)
         ax1.plot(x_axis, history_subset[:, 1], label='left_y', color='g', linewidth=1.5)
         ax1.plot(x_axis, history_subset[:, 2], label='left_z', color='b', linewidth=1.5)
-        ax1.plot(x_axis, history_subset[:, 7], label='left_grip', color='orange', 
+        ax1.plot(x_axis, history_subset[:, 7], label='left_grip', color='orange',
                  linestyle=':', linewidth=2, alpha=0.8)
         ax1.set_ylabel('Position (m)')
         ax1.legend(loc='upper right', fontsize='x-small', ncol=4)
@@ -156,7 +163,7 @@ def visualize_action_step(action_history, step_idx, window=50):
         ax3.plot(x_axis, history_subset[:, 8], label='right_x', color='r', linewidth=1.5, linestyle='--')
         ax3.plot(x_axis, history_subset[:, 9], label='right_y', color='g', linewidth=1.5, linestyle='--')
         ax3.plot(x_axis, history_subset[:, 10], label='right_z', color='b', linewidth=1.5, linestyle='--')
-        ax3.plot(x_axis, history_subset[:, 15], label='right_grip', color='orange', 
+        ax3.plot(x_axis, history_subset[:, 15], label='right_grip', color='orange',
                  linestyle=':', linewidth=2, alpha=0.8)
         ax3.set_ylabel('Position (m)')
         ax3.legend(loc='upper right', fontsize='x-small', ncol=4)
@@ -176,17 +183,17 @@ def visualize_action_step(action_history, step_idx, window=50):
     ax1.set_xlim(max(0, step_idx - window), max(window, step_idx))
     ax3.set_xlabel('Step')
     ax4.set_xlabel('Step')
-    
+
     plt.tight_layout()
     canvas = FigureCanvas(fig)
     canvas.draw()
     img = np.asarray(canvas.buffer_rgba())
     img = img[:, :, :3]
-    
+
     # Convert to uint8
     if img.dtype != np.uint8:
         img = (img * 255).astype(np.uint8)
-        
+
     plt.close(fig)
     return img
 
@@ -198,11 +205,11 @@ def save_comparison_video(real_obs_list, imagined_video, action_history, save_pa
     n_real = len(real_obs_list)
     if imagined_video is not None:
         imagined_video = np.concatenate(imagined_video, 0)
-        n_imagined = len(imagined_video) 
+        n_imagined = len(imagined_video)
     else:
         n_imagined = 0
     n_frames = n_real # Based on real observation frames
-    
+
     print(f"Saving video: Real {n_real} frames, Imagined {n_imagined} frames...")
 
     final_frames = []
@@ -214,7 +221,7 @@ def save_comparison_video(real_obs_list, imagined_video, action_history, save_pa
         cam_right = obs["observation.images.cam_right_wrist"]
 
         base_h = cam_high.shape[0]
-        
+
         def resize_h(img, h):
             if img.shape[0] != h:
                 w = int(img.shape[1] * h / img.shape[0])
@@ -225,11 +232,11 @@ def save_comparison_video(real_obs_list, imagined_video, action_history, save_pa
             return img
 
         row_real = np.hstack([
-            resize_h(cam_high, base_h), 
-            resize_h(cam_left, base_h), 
+            resize_h(cam_high, base_h),
+            resize_h(cam_left, base_h),
             resize_h(cam_right, base_h)
         ])
-        
+
         row_real = np.ascontiguousarray(row_real)
 
         row_real = add_title_bar(row_real, "Real Observation (High / Left / Right)")
@@ -255,7 +262,7 @@ def save_comparison_video(real_obs_list, imagined_video, action_history, save_pa
             row_imagined[y0:y0 + resized_h, x0:x0 + resized_w] = resized
         else:
             row_imagined = np.zeros((imagined_h, target_width, 3), dtype=np.uint8)
-            cv2.putText(row_imagined, "Coming soon", (target_width//2 - 100, imagined_h // 2), 
+            cv2.putText(row_imagined, "Coming soon", (target_width//2 - 100, imagined_h // 2),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (100, 100, 100), 2)
 
         row_imagined = np.ascontiguousarray(row_imagined)
@@ -404,7 +411,7 @@ def main(usr_args):
     suc_nums = []
     test_num = usr_args["test_num"]
 
-    
+
     model = WebsocketClientPolicy(host=usr_args.get('host', '127.0.0.1'), port=usr_args['port'])
 
     st_seed, suc_num = eval_policy(task_name,
@@ -418,7 +425,8 @@ def main(usr_args):
                                    save_visualization=True,
                                    video_guidance_scale=video_guidance_scale,
                                    action_guidance_scale=action_guidance_scale,
-                                   print_profile=usr_args.get('print_profile', False))
+                                   print_profile=usr_args.get('print_profile', False),
+                                   reset_policy_at_half_eval_steps=getattr(va_robotwin_cfg, 'reset_policy_at_half_eval_steps', False))
     suc_nums.append(suc_num)
 
     file_path = os.path.join(save_dir, f"_result.txt")
@@ -451,20 +459,42 @@ def add_init_pose(new_pose, init_pose):
     return np.concatenate([left_pose, right_pose])
 
 
-def _print_profile(ret, episode_idx, infer_idx):
-    profile = ret.get('profile_action_latency') if isinstance(ret, dict) else None
-    if not profile:
-        return
+def _format_profile(profile):
     parts = []
     for record in profile.get('records', []):
         suffix = f" x{record['count']}" if record.get('count', 1) > 1 else ''
         parts.append(f"{record['name']}={record['total_ms']:.2f}ms{suffix}")
-    print(
-        f"[ActionProfile] episode={episode_idx} infer={infer_idx} "
+    return (
         f"name={profile.get('name')} frame_st_id={profile.get('frame_st_id')} "
         f"recorded_cuda={profile.get('total_recorded_cuda_ms', 0):.2f}ms | " +
         ' | '.join(parts)
     )
+
+
+def _print_profile(ret, episode_idx, infer_idx):
+    profile = ret.get('profile_action_latency') if isinstance(ret, dict) else None
+    if not profile:
+        return
+    prefix = f"[ActionProfile] episode={episode_idx} infer={infer_idx} "
+    if 'records' in profile:
+        print(prefix + _format_profile(profile))
+    else:
+        for name, sub_profile in profile.items():
+            if sub_profile:
+                print(prefix + f"{name}: " + _format_profile(sub_profile))
+
+
+def _start_async_prefetch(executor, model, current_action, save_visualization=False,
+                          feedback_obs=None, feedback_state=None):
+    payload = dict(
+        async_prefetch=True,
+        current_action=current_action,
+        save_visualization=save_visualization,
+    )
+    if feedback_obs is not None and feedback_state is not None:
+        payload['feedback_obs'] = feedback_obs
+        payload['feedback_state'] = feedback_state
+    return executor.submit(model.infer, payload)
 
 def eval_policy(task_name,
                 TASK_ENV,
@@ -477,7 +507,8 @@ def eval_policy(task_name,
                 save_visualization=False,
                 video_guidance_scale=5.0,
                 action_guidance_scale=5.0,
-                print_profile=False):
+                print_profile=False,
+                reset_policy_at_half_eval_steps=False):
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
@@ -566,14 +597,16 @@ def eval_policy(task_name,
 
         prompt = TASK_ENV.get_instruction()
         ret = model.infer(dict(reset = True, prompt=prompt, save_visualization=save_visualization))
-        
+
         first = True
         infer_idx = 0
         full_obs_list = []
         gen_video_list = []
         full_action_history = []
+        half_eval_reset_done = False
+        half_eval_reset_step = TASK_ENV.step_lim // 2
 
-        initial_obs = TASK_ENV.get_obs() 
+        initial_obs = TASK_ENV.get_obs()
         inint_eef_pose = initial_obs['endpose']['left_endpose'] + \
         [initial_obs['endpose']['left_gripper']] + \
         initial_obs['endpose']['right_endpose'] + \
@@ -582,68 +615,124 @@ def eval_policy(task_name,
         initial_formatted_obs = format_obs(initial_obs, prompt)
         full_obs_list.append(initial_formatted_obs)
         first_obs = None
-        while TASK_ENV.take_action_cnt<TASK_ENV.step_lim:
-            if first:
-                observation = TASK_ENV.get_obs()
-                first_obs = format_obs(observation, prompt)
+        async_enabled = getattr(va_robotwin_cfg, 'enable_async_inference', False)
+        async_executor = ThreadPoolExecutor(max_workers=1) if async_enabled else None
+        async_future = None
+        pending_feedback_obs = None
+        pending_feedback_state = None
+        current_ret = None
+        try:
+            while TASK_ENV.take_action_cnt<TASK_ENV.step_lim:
+                if (reset_policy_at_half_eval_steps and not half_eval_reset_done
+                        and not TASK_ENV.eval_success and TASK_ENV.take_action_cnt >= half_eval_reset_step):
+                    reset_obs = TASK_ENV.get_obs()
+                    inint_eef_pose = reset_obs['endpose']['left_endpose'] + \
+                    [reset_obs['endpose']['left_gripper']] + \
+                    reset_obs['endpose']['right_endpose'] + \
+                    [reset_obs['endpose']['right_gripper']]
+                    inint_eef_pose = np.array(inint_eef_pose, dtype=np.float64)
+                    first_obs = format_obs(reset_obs, prompt)
+                    model.infer(dict(reset=True, prompt=prompt, save_visualization=save_visualization))
+                    first = True
+                    current_ret = None
+                    pending_feedback_obs = None
+                    pending_feedback_state = None
+                    half_eval_reset_done = True
+                    print(f"[EvalReset] Reset policy cache at step {TASK_ENV.take_action_cnt}/{TASK_ENV.step_lim}")
 
-            ret = model.infer(dict(obs=first_obs, prompt=prompt, save_visualization=save_visualization, video_guidance_scale=video_guidance_scale, action_guidance_scale=action_guidance_scale)) #(TASK_ENV, model, observation)
-            if print_profile:
-                _print_profile(ret, now_seed, infer_idx)
-            action = ret['action']
-            if 'video' in ret:
-                imagined_video = ret['video']
-                gen_video_list.append(imagined_video)
-            key_frame_list = []
+                if first:
+                    observation = TASK_ENV.get_obs()
+                    first_obs = format_obs(observation, prompt)
 
-            assert action.shape[2] % 4 == 0
-            action_per_frame = action.shape[2] // 4
+                if current_ret is None:
+                    current_ret = model.infer(dict(obs=first_obs, prompt=prompt, save_visualization=save_visualization, video_guidance_scale=video_guidance_scale, action_guidance_scale=action_guidance_scale)) #(TASK_ENV, model, observation)
+                    if print_profile:
+                        _print_profile(current_ret, now_seed, infer_idx)
+                action = current_ret['action']
+                if 'video' in current_ret:
+                    imagined_video = current_ret['video']
+                    gen_video_list.append(imagined_video)
 
-            start_idx = 1 if first else 0
-            for i in range(start_idx, action.shape[1]):
-                for j in range(action.shape[2]):
-                    raw_action_step = action[:, i, j].flatten() 
-                    full_action_history.append(raw_action_step)
+                if async_enabled and not first:
+                    async_future = _start_async_prefetch(
+                        async_executor,
+                        model,
+                        action,
+                        save_visualization=save_visualization,
+                        feedback_obs=pending_feedback_obs,
+                        feedback_state=pending_feedback_state)
+                    pending_feedback_obs = None
+                    pending_feedback_state = None
 
-                    ee_action = action[:, i, j]
-                    if action.shape[0] == 14:
-                        ee_action = np.concatenate([
-                            ee_action[:3],
-                            euler2quat(ee_action[3], ee_action[4], ee_action[5]),
-                            ee_action[6:10],
-                            euler2quat(ee_action[10], ee_action[11], ee_action[12]),
-                            ee_action[13:14]
-                        ])
-                    elif action.shape[0] == 16:
-                        ee_action =  add_init_pose(ee_action, inint_eef_pose)
-                        ee_action = np.concatenate([
-                            ee_action[:3],
-                            ee_action[3:7] / np.linalg.norm(ee_action[3:7]),
-                            ee_action[7:11],
-                            ee_action[11:15] / np.linalg.norm(ee_action[11:15]),
-                            ee_action[15:16]
-                        ])
-                    else:
-                        raise NotImplementedError
-                    TASK_ENV.take_action(ee_action, action_type='ee')
-                   
-                    if (j+1) % action_per_frame == 0:
-                        obs = format_obs(TASK_ENV.get_obs(), prompt)
-                        full_obs_list.append(obs)
-                        key_frame_list.append(obs)
-                    
-            first = False
+                key_frame_list = []
 
-            infer_idx += 1
-            ret = model.infer(dict(obs = key_frame_list, compute_kv_cache=True, imagine=False, save_visualization=save_visualization, state=action))
-            if print_profile:
-                _print_profile(ret, now_seed, infer_idx)
-            infer_idx += 1
-  
-            if TASK_ENV.eval_success:
-                succ = True
-                break
-      
+                assert action.shape[2] % 4 == 0
+                action_per_frame = action.shape[2] // 4
+
+                start_idx = 1 if first else 0
+                for i in range(start_idx, action.shape[1]):
+                    for j in range(action.shape[2]):
+                        raw_action_step = action[:, i, j].flatten()
+                        full_action_history.append(raw_action_step)
+
+                        ee_action = action[:, i, j]
+                        if action.shape[0] == 14:
+                            ee_action = np.concatenate([
+                                ee_action[:3],
+                                euler2quat(ee_action[3], ee_action[4], ee_action[5]),
+                                ee_action[6:10],
+                                euler2quat(ee_action[10], ee_action[11], ee_action[12]),
+                                ee_action[13:14]
+                            ])
+                        elif action.shape[0] == 16:
+                            ee_action =  add_init_pose(ee_action, inint_eef_pose)
+                            ee_action = np.concatenate([
+                                ee_action[:3],
+                                ee_action[3:7] / np.linalg.norm(ee_action[3:7]),
+                                ee_action[7:11],
+                                ee_action[11:15] / np.linalg.norm(ee_action[11:15]),
+                                ee_action[15:16]
+                            ])
+                        else:
+                            raise NotImplementedError
+                        TASK_ENV.take_action(ee_action, action_type='ee')
+
+                        if (j+1) % action_per_frame == 0:
+                            obs = format_obs(TASK_ENV.get_obs(), prompt)
+                            full_obs_list.append(obs)
+                            key_frame_list.append(obs)
+
+                was_first = first
+                first = False
+
+                infer_idx += 1
+                if async_enabled and not was_first:
+                    current_ret = async_future.result()
+                    async_future = None
+                    if print_profile:
+                        _print_profile(current_ret, now_seed, infer_idx)
+                    pending_feedback_obs = key_frame_list
+                    pending_feedback_state = action
+                    infer_idx += 1
+                else:
+                    ret = model.infer(dict(obs = key_frame_list, compute_kv_cache=True, imagine=False, save_visualization=save_visualization, state=action))
+                    if print_profile:
+                        _print_profile(ret, now_seed, infer_idx)
+                    infer_idx += 1
+                    current_ret = None
+
+                if TASK_ENV.eval_success:
+                    succ = True
+                    break
+        finally:
+            if async_future is not None:
+                try:
+                    async_future.result()
+                except Exception:
+                    traceback.print_exc()
+            if async_executor is not None:
+                async_executor.shutdown(wait=True, cancel_futures=True)
+
 
         vis_dir = Path(args['save_root']) / f'stseed-{st_seed}' / 'visualization' / task_name
         vis_dir.mkdir(parents=True, exist_ok=True)
@@ -681,7 +770,7 @@ def eval_policy(task_name,
           "total_num": float(TASK_ENV.test_num),
           "succ_rate": float(TASK_ENV.suc / TASK_ENV.test_num),
         }, out_json_file)
-        
+
         print(
             f"\033[93m{task_name}\033[0m | \033[94m{args['policy_name']}\033[0m | \033[92m{args['task_config']}\033[0m | \033[91m{args['ckpt_setting']}\033[0m\n"
             f"Success rate: \033[96m{TASK_ENV.suc}/{TASK_ENV.test_num}\033[0m => \033[95m{round(TASK_ENV.suc/TASK_ENV.test_num*100, 1)}%\033[0m, current seed: \033[90m{now_seed}\033[0m\n"
@@ -728,7 +817,7 @@ def parse_args_and_config():
 
 
 if __name__ == "__main__":
-    
+
     Sapien_TEST()
     usr_args = parse_args_and_config()
     main(usr_args)

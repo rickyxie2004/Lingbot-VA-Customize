@@ -41,7 +41,7 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 python -m evaluation.robotwin.eval_polict_cli
     --save_root ${save_root} \
     --video_guidance_scale 5 \
     --action_guidance_scale 1 \
-    --test_num 100 \
+    --test_num 50 \
     --port ${PORT} \
     --host ${SERVER_HOST} \
     "${PROFILE_ARGS[@]}"
