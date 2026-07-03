@@ -39,6 +39,31 @@ from utils import (
 )
 
 
+class LatentMSESpeculativeVerifier:
+
+    def __init__(self, threshold):
+        self.threshold = float(threshold)
+
+    def verify(self, real_latent, pred_latent):
+        score = torch.mean((real_latent.float() - pred_latent.float()) ** 2).item()
+        return score, bool(score < self.threshold)
+
+
+class ActionDenoiseSpeculativeVerifier:
+
+    def __init__(self, threshold):
+        self.threshold = float(threshold)
+
+    def verify(self, pred_velocity, actual_velocity, action_mask=None):
+        pred_velocity = pred_velocity.float()
+        actual_velocity = actual_velocity.float()
+        if action_mask is not None:
+            pred_velocity = pred_velocity[:, action_mask]
+            actual_velocity = actual_velocity[:, action_mask]
+        score = torch.mean((pred_velocity - actual_velocity) ** 2).item()
+        return score, bool(score < self.threshold)
+
+
 class _CudaActionLatencyProfiler:
 
     def __init__(self, enabled, device, profile_steps=False):
@@ -167,11 +192,23 @@ class VA_Server:
 
         if getattr(job_config, 'compile_infer', False):
             logger.info("Enable torch.compile for VA_Server._infer")
+            self._encode_obs = torch.compiler.disable(
+                self._encode_obs,
+                reason="Keep read-only numpy websocket inputs out of Dynamo.",
+            )
+            self.postprocess_action = torch.compiler.disable(
+                self.postprocess_action,
+                reason="Keep numpy action output conversion out of Dynamo.",
+            )
+            self._decode_pred_video = torch.compiler.disable(
+                self._decode_pred_video,
+                reason="Keep optional VAE video decoding out of Dynamo.",
+            )
             self._infer = torch.compile(
                 self._infer,
                 dynamic=False,
                 fullgraph=False,
-                mode="max-autotune",
+                mode="default",
             )
 
     def _get_t5_prompt_embeds(
@@ -322,15 +359,75 @@ class VA_Server:
         action = action.squeeze(0).detach().cpu().numpy()
         return action[self.job_config.used_action_channel_ids]
     
-    def _repeat_input_for_cfg(self, input_dict):
-        if self.use_cfg:
-            input_dict['noisy_latents'] = input_dict['noisy_latents'].repeat(2, 1, 1, 1, 1)
-            input_dict['text_emb'] = torch.cat([self.prompt_embeds.to(self.dtype).clone(), self.negative_prompt_embeds.to(self.dtype).clone()], dim=0)
-            input_dict['grid_id'] = input_dict['grid_id'][None].repeat(2, 1, 1)
-            input_dict['timesteps'] = input_dict['timesteps'][None].repeat(2, 1)
+    def _postprocess_action_batch(self, action):
+        action = action.cpu()[..., 0]  # B, C, F, H
+        if self.action_norm_method == 'quantiles':
+            actions_q01 = self.actions_q01.cpu().view(1, -1, 1, 1)
+            actions_q99 = self.actions_q99.cpu().view(1, -1, 1, 1)
+            action = (action + 1) / 2 * (actions_q99 - actions_q01 + 1e-6) + actions_q01
         else:
-            input_dict['grid_id'] = input_dict['grid_id'][None]
-            input_dict['timesteps'] = input_dict['timesteps'][None]
+            raise NotImplementedError
+        action = action.detach().cpu().numpy()
+        return action[:, self.job_config.used_action_channel_ids]
+
+    def _clone_transformer_cache(self):
+        cache_snapshot = []
+        for block in self.transformer.blocks:
+            attn_caches = block.attn1.attn_caches
+            cache = None if attn_caches is None else attn_caches.get(self.cache_name)
+            if cache is None:
+                cache_snapshot.append(None)
+            else:
+                cache_snapshot.append({
+                    key: value.clone() if torch.is_tensor(value) else value
+                    for key, value in cache.items()
+                })
+        return cache_snapshot
+
+    def _restore_transformer_cache(self, cache_snapshot):
+        for block, cache in zip(self.transformer.blocks, cache_snapshot):
+            if block.attn1.attn_caches is not None:
+                block.attn1.attn_caches[self.cache_name] = cache
+
+    def _expand_transformer_cache_batch(self, batch_size):
+        cache_batch_size = batch_size * (2 if self.use_cfg else 1)
+        for block in self.transformer.blocks:
+            attn_caches = block.attn1.attn_caches
+            if attn_caches is None or attn_caches.get(self.cache_name) is None:
+                continue
+            cache = attn_caches[self.cache_name]
+            if cache.get('k') is not None:
+                if self.use_cfg and cache['k'].shape[0] >= 2:
+                    cache['k'] = torch.cat([
+                        cache['k'][:1].clone().repeat(batch_size, 1, 1, 1),
+                        cache['k'][1:2].clone().repeat(batch_size, 1, 1, 1),
+                    ], dim=0)
+                else:
+                    cache['k'] = cache['k'][:1].clone().repeat(cache_batch_size, 1, 1, 1)
+            if cache.get('v') is not None:
+                if self.use_cfg and cache['v'].shape[0] >= 2:
+                    cache['v'] = torch.cat([
+                        cache['v'][:1].clone().repeat(batch_size, 1, 1, 1),
+                        cache['v'][1:2].clone().repeat(batch_size, 1, 1, 1),
+                    ], dim=0)
+                else:
+                    cache['v'] = cache['v'][:1].clone().repeat(cache_batch_size, 1, 1, 1)
+
+    def _repeat_input_for_cfg(self, input_dict):
+        batch_size = input_dict['noisy_latents'].shape[0]
+        if self.use_cfg:
+            input_dict['noisy_latents'] = torch.cat(
+                [input_dict['noisy_latents'], input_dict['noisy_latents']], dim=0)
+            input_dict['text_emb'] = torch.cat([
+                self.prompt_embeds.to(self.dtype).clone().repeat(batch_size, 1, 1),
+                self.negative_prompt_embeds.to(self.dtype).clone().repeat(batch_size, 1, 1),
+            ], dim=0)
+            input_dict['grid_id'] = input_dict['grid_id'][None].repeat(batch_size * 2, 1, 1)
+            input_dict['timesteps'] = input_dict['timesteps'][None].repeat(batch_size * 2, 1)
+        else:
+            input_dict['text_emb'] = self.prompt_embeds.to(self.dtype).clone().repeat(batch_size, 1, 1)
+            input_dict['grid_id'] = input_dict['grid_id'][None].repeat(batch_size, 1, 1)
+            input_dict['timesteps'] = input_dict['timesteps'][None].repeat(batch_size, 1)
         return input_dict
 
     def _prepare_latent_input(self,
@@ -467,11 +564,22 @@ class VA_Server:
                 self.job_config.obs_cam_keys)
 
         patch_size = self.job_config.patch_size
-        latent_token_per_chunk = (self.job_config.frame_chunk_size *
+        cache_frame_chunk_size = self.job_config.frame_chunk_size
+        if getattr(self.job_config, 'enable_speculative_verifier', False):
+            speculative_frame_chunk_size = int(getattr(
+                self.job_config, 'speculative_frame_chunk_size', cache_frame_chunk_size))
+            replan_frame_chunk_size = int(getattr(
+                self.job_config, 'speculative_replan_frame_chunk_size', -1))
+            if replan_frame_chunk_size <= 0:
+                replan_frame_chunk_size = speculative_frame_chunk_size
+            speculative_cache_chunk_size = max(
+                speculative_frame_chunk_size, replan_frame_chunk_size) + 1
+            cache_frame_chunk_size = max(cache_frame_chunk_size, speculative_cache_chunk_size)
+        latent_token_per_chunk = (cache_frame_chunk_size *
                                   self.latent_height * self.latent_width) // (
                                       patch_size[0] * patch_size[1] *
                                       patch_size[2])
-        action_token_per_chunk = self.job_config.frame_chunk_size * self.action_per_frame
+        action_token_per_chunk = cache_frame_chunk_size * self.action_per_frame
         self.transformer.create_empty_cache(self.cache_name,
                                             self.job_config.attn_window,
                                             latent_token_per_chunk,
@@ -531,9 +639,16 @@ class VA_Server:
             ' | '.join(parts)
         )
 
-    def _infer(self, obs, frame_st_id=0):
+    def _infer(
+        self,
+        obs,
+        frame_st_id=0,
+        video_num_inference_steps=None,
+        action_num_inference_steps=None,
+        frame_chunk_size=None,
+    ):
         profiler = self._new_latency_profiler()
-        frame_chunk_size = self.job_config.frame_chunk_size
+        frame_chunk_size = int(frame_chunk_size or self.job_config.frame_chunk_size)
         if frame_st_id == 0:
             with profiler.record('obs.encode'):
                 init_latent = self._encode_obs(obs)
@@ -555,8 +670,16 @@ class VA_Server:
                                   device=self.device,
                                   dtype=self.dtype)
 
-        video_inference_step = self.job_config.num_inference_steps
-        action_inference_step = self.job_config.action_num_inference_steps
+        video_inference_step = (
+            int(video_num_inference_steps)
+            if video_num_inference_steps is not None
+            else self.job_config.num_inference_steps
+        )
+        action_inference_step = (
+            int(action_num_inference_steps)
+            if action_num_inference_steps is not None
+            else self.job_config.action_num_inference_steps
+        )
         video_step = self.job_config.video_exec_step
 
         self.scheduler.set_timesteps(video_inference_step)
@@ -682,6 +805,481 @@ class VA_Server:
         self._log_latency_profile(profile)
         return actions, latents, profile, pred_video
 
+    def _infer_video_branch_for_action_diversity(self, obs, frame_st_id=0, batch_size=1):
+        profiler = self._new_latency_profiler()
+        frame_chunk_size = self.job_config.frame_chunk_size
+        if frame_st_id == 0 and self.init_latent is None:
+            with profiler.record('diversity.obs.encode'):
+                self.init_latent = self._encode_obs(obs)
+
+        with profiler.record('diversity.video_noise.init'):
+            latents = torch.randn(batch_size,
+                                  48,
+                                  frame_chunk_size,
+                                  self.latent_height,
+                                  self.latent_width,
+                                  device=self.device,
+                                  dtype=self.dtype)
+
+        video_inference_step = self.job_config.num_inference_steps
+        video_step = self.job_config.video_exec_step
+        self.scheduler.set_timesteps(video_inference_step)
+        timesteps = F.pad(self.scheduler.timesteps, (0, 1), mode='constant', value=0)
+        if video_step != -1:
+            timesteps = timesteps[:video_step]
+
+        with torch.no_grad():
+            with profiler.record('diversity.video.loop'):
+                for i, t in enumerate(tqdm(timesteps)):
+                    step_suffix = f'.step_{i:02d}' if profiler.profile_steps else ''
+                    last_step = i == len(timesteps) - 1
+                    latent_cond = self.init_latent[:, :, 0:1].to(
+                        self.dtype).repeat(batch_size, 1, 1, 1, 1) if frame_st_id == 0 else None
+                    with profiler.record(f'diversity.video.prepare_input{step_suffix}'):
+                        input_dict = self._prepare_latent_input(
+                            latents,
+                            None,
+                            t,
+                            t,
+                            latent_cond,
+                            None,
+                            frame_st_id=frame_st_id)
+                    with profiler.record(f'diversity.video.transformer{step_suffix}'):
+                        video_noise_pred = self.transformer(
+                            self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+                            update_cache=1 if last_step else 0,
+                            cache_name=self.cache_name,
+                            action_mode=False)
+                    if not last_step or video_step != -1:
+                        with profiler.record(f'diversity.video.scheduler_step{step_suffix}'):
+                            video_noise_pred = data_seq_to_patch(
+                                self.job_config.patch_size, video_noise_pred,
+                                frame_chunk_size, self.latent_height,
+                                self.latent_width, batch_size=batch_size * (2 if self.use_cfg else 1))
+                            if self.job_config.guidance_scale > 1:
+                                video_noise_pred = video_noise_pred[batch_size:] + self.job_config.guidance_scale * (video_noise_pred[:batch_size] - video_noise_pred[batch_size:])
+                            else:
+                                video_noise_pred = video_noise_pred[:batch_size]
+                            latents = self.scheduler.step(video_noise_pred,
+                                                          t,
+                                                          latents,
+                                                          return_dict=False)
+                    latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
+        profile = profiler.summary('video_branch_for_action_diversity', frame_st_id=frame_st_id)
+        self._log_latency_profile(profile)
+        return latents, profile
+
+    def _compute_action_diversity_metrics(self, actions, frame_st_id):
+        action_arr = np.stack([np.asarray(action, dtype=np.float32) for action in actions], axis=0)
+        flat = action_arr.reshape(action_arr.shape[0], -1)
+        std = np.std(action_arr, axis=0)
+        pairwise_rmse = []
+        pairwise_abs_mean = []
+        pairwise_l2 = []
+        for i in range(flat.shape[0]):
+            for j in range(i + 1, flat.shape[0]):
+                diff = flat[i] - flat[j]
+                pairwise_rmse.append(float(np.sqrt(np.mean(diff ** 2))))
+                pairwise_abs_mean.append(float(np.mean(np.abs(diff))))
+                pairwise_l2.append(float(np.linalg.norm(diff)))
+        metrics = {
+            'frame_st_id': int(frame_st_id),
+            'num_branches': int(action_arr.shape[0]),
+            'action_shape': list(action_arr.shape[1:]),
+            'std_mean': float(np.mean(std)),
+            'std_max': float(np.max(std)),
+            'std_p95': float(np.percentile(std, 95)),
+        }
+        if pairwise_rmse:
+            metrics.update({
+                'pairwise_rmse_mean': float(np.mean(pairwise_rmse)),
+                'pairwise_rmse_min': float(np.min(pairwise_rmse)),
+                'pairwise_rmse_max': float(np.max(pairwise_rmse)),
+                'pairwise_abs_mean_mean': float(np.mean(pairwise_abs_mean)),
+                'pairwise_abs_mean_max': float(np.max(pairwise_abs_mean)),
+                'pairwise_l2_mean': float(np.mean(pairwise_l2)),
+                'pairwise_l2_max': float(np.max(pairwise_l2)),
+            })
+        else:
+            metrics.update({
+                'pairwise_rmse_mean': 0.0,
+                'pairwise_rmse_min': 0.0,
+                'pairwise_rmse_max': 0.0,
+                'pairwise_abs_mean_mean': 0.0,
+                'pairwise_abs_mean_max': 0.0,
+                'pairwise_l2_mean': 0.0,
+                'pairwise_l2_max': 0.0,
+            })
+        return metrics
+
+    def _log_video_branch_action_diversity(self, metrics):
+        message = (
+            f"[VideoBranchActionDiversity] frame_st_id={metrics['frame_st_id']} "
+            f"branches={metrics['num_branches']} action_shape={metrics['action_shape']} "
+            f"std_mean={metrics['std_mean']:.6f} std_max={metrics['std_max']:.6f} "
+            f"std_p95={metrics['std_p95']:.6f} "
+            f"pairwise_rmse_mean={metrics['pairwise_rmse_mean']:.6f} "
+            f"pairwise_rmse_min={metrics['pairwise_rmse_min']:.6f} "
+            f"pairwise_rmse_max={metrics['pairwise_rmse_max']:.6f} "
+            f"pairwise_abs_mean_mean={metrics['pairwise_abs_mean_mean']:.6f} "
+            f"pairwise_l2_mean={metrics['pairwise_l2_mean']:.6f}"
+        )
+        logger.info(message)
+        log_path = getattr(self.job_config, 'video_branch_action_diversity_log_path', None)
+        if log_path:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(message + '\n')
+
+    def _compute_video_branch_action_diversity(self, obs, frame_st_id=0):
+        num_branches = int(getattr(self.job_config, 'video_branch_action_diversity_num', 8))
+        if num_branches <= 0:
+            return None
+        logger.info(
+            f"[VideoBranchActionDiversity] Generate {num_branches} batched branches "
+            f"at frame_st_id={frame_st_id}"
+        )
+        cache_snapshot = self._clone_transformer_cache()
+        try:
+            self.transformer.clear_pred_cache(self.cache_name)
+            self._expand_transformer_cache_batch(num_branches)
+            self._infer_video_branch_for_action_diversity(
+                obs, frame_st_id=frame_st_id, batch_size=num_branches)
+            actions, _ = self._infer_action_only(
+                frame_st_id=frame_st_id, batch_size=num_branches)
+        finally:
+            self._restore_transformer_cache(cache_snapshot)
+        metrics = self._compute_action_diversity_metrics(actions, frame_st_id)
+        self._log_video_branch_action_diversity(metrics)
+        return metrics
+
+    def _infer_action_only(self, frame_st_id=0, initial_actions=None, batch_size=1):
+        profiler = self._new_latency_profiler()
+        frame_chunk_size = self.job_config.frame_chunk_size
+        with profiler.record('compare.action_noise.init'):
+            if initial_actions is None:
+                actions = torch.randn(batch_size,
+                                      self.job_config.action_dim,
+                                      frame_chunk_size,
+                                      self.action_per_frame,
+                                      1,
+                                      device=self.device,
+                                      dtype=self.dtype)
+            else:
+                actions = initial_actions.clone().to(device=self.device, dtype=self.dtype)
+
+        action_inference_step = self.job_config.action_num_inference_steps
+        self.action_scheduler.set_timesteps(action_inference_step)
+        action_timesteps = F.pad(
+            self.action_scheduler.timesteps,
+            (0, 1),
+            mode='constant',
+            value=0)
+
+        with torch.no_grad():
+            with profiler.record('compare.action.loop'):
+                for i, t in enumerate(tqdm(action_timesteps)):
+                    step_suffix = f'.step_{i:02d}' if profiler.profile_steps else ''
+                    last_step = i == len(action_timesteps) - 1
+                    action_cond = torch.zeros(
+                        [
+                            batch_size, self.job_config.action_dim, 1,
+                            self.action_per_frame, 1
+                        ],
+                        device=self.device,
+                        dtype=self.dtype) if frame_st_id == 0 else None
+                    with profiler.record(f'compare.action.prepare_input{step_suffix}'):
+                        input_dict = self._prepare_latent_input(
+                            None,
+                            actions,
+                            t,
+                            t,
+                            None,
+                            action_cond,
+                            frame_st_id=frame_st_id)
+                    with profiler.record(f'compare.action.transformer{step_suffix}'):
+                        action_noise_pred = self.transformer(
+                            self._repeat_input_for_cfg(input_dict['action_res_lst']),
+                            update_cache=1 if last_step else 0,
+                            cache_name=self.cache_name,
+                            action_mode=True)
+                    if not last_step:
+                        with profiler.record(f'compare.action.scheduler_step{step_suffix}'):
+                            action_noise_pred = rearrange(action_noise_pred,
+                                                          'b (f n) c -> b c f n 1',
+                                                          f=frame_chunk_size)
+                            if self.job_config.action_guidance_scale > 1:
+                                action_noise_pred = action_noise_pred[batch_size:] + self.job_config.action_guidance_scale * (action_noise_pred[:batch_size] - action_noise_pred[batch_size:])
+                            else:
+                                action_noise_pred = action_noise_pred[:batch_size]
+                            actions = self.action_scheduler.step(action_noise_pred,
+                                                                 t,
+                                                                 actions,
+                                                                 return_dict=False)
+                    actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
+
+        with profiler.record('compare.action.mask'):
+            actions[:, ~self.action_mask] *= 0
+        with profiler.record('compare.action.postprocess'):
+            actions = self.postprocess_action(actions) if batch_size == 1 else self._postprocess_action_batch(actions)
+        profile = profiler.summary('compare_action_generation', frame_st_id=frame_st_id)
+        self._log_latency_profile(profile)
+        return actions, profile
+
+    def _encode_obs_preserve_vae_cache(self, obs):
+        vae_feat_cache = [x.clone() if torch.is_tensor(x) else x for x in self.streaming_vae.feat_cache]
+        vae_half_feat_cache = None
+        if hasattr(self, 'streaming_vae_half'):
+            vae_half_feat_cache = [x.clone() if torch.is_tensor(x) else x for x in self.streaming_vae_half.feat_cache]
+        try:
+            with torch.no_grad():
+                return self._encode_obs(obs)
+        finally:
+            self.streaming_vae.feat_cache = vae_feat_cache
+            if vae_half_feat_cache is not None:
+                self.streaming_vae_half.feat_cache = vae_half_feat_cache
+
+    def _infer_speculative_draft(self, obs):
+        base_future_frame_chunk_size = int(getattr(
+            self.job_config, 'speculative_frame_chunk_size', self.job_config.frame_chunk_size))
+        full_denoise_replan = bool(obs.get('speculative_full_denoise', False))
+        future_frame_chunk_size = base_future_frame_chunk_size
+        if full_denoise_replan:
+            replan_frame_chunk_size = int(getattr(
+                self.job_config, 'speculative_replan_frame_chunk_size', -1))
+            if replan_frame_chunk_size > 0:
+                future_frame_chunk_size = replan_frame_chunk_size
+            video_steps = int(self.job_config.num_inference_steps)
+            action_steps = int(self.job_config.action_num_inference_steps)
+        else:
+            video_steps = int(getattr(
+                self.job_config, 'speculative_video_num_inference_steps', self.job_config.num_inference_steps))
+            action_steps = int(getattr(
+                self.job_config, 'speculative_action_num_inference_steps', self.job_config.action_num_inference_steps))
+        frame_chunk_size = future_frame_chunk_size + 1 if self.frame_st_id == 0 else future_frame_chunk_size
+        logger.info(
+            f"[SpeculativeDraft] frame_st_id={self.frame_st_id} full_denoise_replan={full_denoise_replan} "
+            f"video_steps={video_steps} action_steps={action_steps} frame_chunk_size={frame_chunk_size} "
+            f"future_frame_chunk_size={future_frame_chunk_size} base_future_frame_chunk_size={base_future_frame_chunk_size}"
+        )
+        action, latents, profile, pred_video = self._infer(
+            obs,
+            frame_st_id=self.frame_st_id,
+            video_num_inference_steps=video_steps,
+            action_num_inference_steps=action_steps,
+            frame_chunk_size=frame_chunk_size,
+        )
+        # Do not let speculative future tokens become committed history.
+        self.transformer.clear_pred_cache(self.cache_name)
+        result = {
+            'action': action,
+            'speculative_pred_latents': latents.detach().float().cpu().numpy(),
+            'speculative_frame_chunk_size': int(base_future_frame_chunk_size),
+            'speculative_replan_frame_chunk_size_used': int(future_frame_chunk_size),
+            'speculative_draft_frame_chunk_size': int(frame_chunk_size),
+            'speculative_segment_action_steps': int(getattr(
+                self.job_config, 'speculative_segment_action_steps', self.action_per_frame)),
+            'speculative_full_denoise_replan': bool(full_denoise_replan),
+            'speculative_video_num_inference_steps_used': int(video_steps),
+            'speculative_action_num_inference_steps_used': int(action_steps),
+        }
+        if pred_video is not None:
+            result['video'] = pred_video
+        if profile:
+            result['profile_action_latency'] = profile
+        return result
+
+    def _to_single_frame_pred_latent(self, pred_latent, ref_latent):
+        pred_latent = torch.from_numpy(np.asarray(pred_latent)).to(
+            device=ref_latent.device, dtype=ref_latent.dtype)
+        if pred_latent.ndim == 3:
+            pred_latent = pred_latent[None, :, None]
+        elif pred_latent.ndim == 4:
+            pred_latent = pred_latent[None]
+        if pred_latent.shape[2] != 1:
+            pred_latent = pred_latent[:, :, -1:]
+        return pred_latent.to(ref_latent)
+
+    def _verify_speculative(self, obs):
+        mode = getattr(self.job_config, 'speculative_verifier_mode', 'action_denoise')
+        if mode == 'latent_mse':
+            return self._verify_speculative_latent(obs)
+        if mode == 'action_denoise':
+            return self._verify_speculative_action_denoise(obs)
+        raise ValueError(f'Unknown speculative_verifier_mode: {mode}')
+
+    def _verify_speculative_action_denoise(self, obs):
+        real_obs = obs.get('obs', None)
+        pred_latent = obs.get('pred_latent', None)
+        draft_action = obs.get('draft_action', None)
+        segment_index = int(obs.get('segment_index', -1))
+        verify_frame_offset = int(obs.get('verify_frame_offset', 0))
+        verify_frame_st_id = int(self.frame_st_id + verify_frame_offset)
+        if real_obs is None or pred_latent is None or draft_action is None:
+            raise ValueError('action_denoise speculative_verify requires obs, pred_latent, and draft_action')
+
+        real_obs_list = real_obs if isinstance(real_obs, list) else [real_obs]
+        real_latent = self._encode_obs_preserve_vae_cache({'obs': real_obs_list})
+        current_latent = real_latent[:, :, -1:].to(self.device).to(self.dtype)
+        pred_latent = self._to_single_frame_pred_latent(pred_latent, current_latent)
+        latent_condition = torch.cat([current_latent, pred_latent], dim=2)
+
+        action_model_input = self.preprocess_action(np.asarray(draft_action)).to(
+            device=self.device, dtype=self.dtype)
+        verifier_sigma = float(getattr(
+            self.job_config, 'speculative_verifier_action_noise_sigma', 0.15))
+        verifier_sigma = max(0.0, min(1.0, verifier_sigma))
+        self.action_scheduler.set_timesteps(self.action_scheduler.num_train_timesteps)
+        sigma_id = torch.argmin((self.action_scheduler.sigmas - verifier_sigma).abs())
+        sigma = self.action_scheduler.sigmas[sigma_id].to(
+            device=self.device, dtype=action_model_input.dtype)
+        action_t = self.action_scheduler.timesteps[sigma_id].to(self.device)
+        noise = torch.randn_like(action_model_input)
+        noisy_action = ((1 - sigma) * action_model_input + sigma * noise).to(self.dtype)
+
+        profiler = self._new_latency_profiler()
+        threshold = float(getattr(self.job_config, 'speculative_verifier_threshold', 0.5))
+        cache_snapshot = self._clone_transformer_cache()
+        try:
+            self.transformer.clear_pred_cache(self.cache_name)
+            with profiler.record('verify.cache_video_condition'):
+                self._cache_pred_latent_chunk(latent_condition, verify_frame_st_id)
+            with profiler.record('verify.prepare_action'):
+                input_dict = self._prepare_latent_input(
+                    None,
+                    noisy_action,
+                    action_t=action_t,
+                    frame_st_id=verify_frame_st_id)
+            with torch.no_grad():
+                with profiler.record('verify.action_transformer'):
+                    pred_velocity = self.transformer(
+                        self._repeat_input_for_cfg(input_dict['action_res_lst']),
+                        update_cache=0,
+                        cache_name=self.cache_name,
+                        action_mode=True)
+            pred_velocity = rearrange(pred_velocity,
+                                      'b (f n) c -> b c f n 1',
+                                      f=action_model_input.shape[2])
+            batch_size = action_model_input.shape[0]
+            if self.job_config.action_guidance_scale > 1:
+                pred_velocity = pred_velocity[batch_size:] + self.job_config.action_guidance_scale * (
+                    pred_velocity[:batch_size] - pred_velocity[batch_size:])
+            else:
+                pred_velocity = pred_velocity[:batch_size]
+            actual_velocity = noise - action_model_input
+            pred_velocity[:, ~self.action_mask] *= 0
+            actual_velocity[:, ~self.action_mask] *= 0
+            verifier = ActionDenoiseSpeculativeVerifier(threshold)
+            score, passed = verifier.verify(pred_velocity, actual_velocity, self.action_mask)
+        finally:
+            self._restore_transformer_cache(cache_snapshot)
+
+        profile = profiler.summary('speculative_action_denoise_verify', frame_st_id=verify_frame_st_id)
+        self._log_latency_profile(profile)
+        message = (
+            f"[SpeculativeVerifier] mode=action_denoise frame_st_id={self.frame_st_id} "
+            f"verify_frame_st_id={verify_frame_st_id} segment={segment_index} "
+            f"score={score:.6f} threshold={threshold:.6f} "
+            f"passed={passed} action_t={float(action_t.detach().cpu()):.6f} "
+            f"sigma={float(sigma.detach().cpu()):.6f} target=actual_velocity "
+            f"obs_frames={len(real_obs_list)} condition_frames={latent_condition.shape[2]}"
+        )
+        logger.info(message)
+        log_path = getattr(self.job_config, 'speculative_verifier_log_path', None)
+        if log_path:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(message + '\n')
+        return {
+            'speculative_verify_score': float(score),
+            'speculative_verify_passed': bool(passed),
+            'speculative_verify_threshold': float(threshold),
+            'speculative_verifier_mode': 'action_denoise',
+            'segment_index': int(segment_index),
+        }
+
+    def _verify_speculative_latent(self, obs):
+        real_obs = obs.get('obs', None)
+        pred_latent = obs.get('pred_latent', None)
+        segment_index = int(obs.get('segment_index', -1))
+        if real_obs is None or pred_latent is None:
+            raise ValueError('speculative_verify requires obs and pred_latent')
+        real_obs_list = real_obs if isinstance(real_obs, list) else [real_obs]
+        real_latent = self._encode_obs_preserve_vae_cache({'obs': real_obs_list})
+        pred_latent = self._to_single_frame_pred_latent(pred_latent, real_latent)
+
+        if real_latent.shape[2] != pred_latent.shape[2]:
+            real_latent = real_latent[:, :, -pred_latent.shape[2]:]
+        pred_latent = pred_latent.to(real_latent)
+        threshold = float(getattr(self.job_config, 'speculative_verifier_threshold', 0.5))
+        verifier = LatentMSESpeculativeVerifier(threshold)
+        score, passed = verifier.verify(real_latent, pred_latent)
+        message = (
+            f"[SpeculativeVerifier] mode=latent_mse frame_st_id={self.frame_st_id} segment={segment_index} "
+            f"score={score:.6f} threshold={threshold:.6f} passed={passed}"
+        )
+        logger.info(message)
+        log_path = getattr(self.job_config, 'speculative_verifier_log_path', None)
+        if log_path:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(message + '\n')
+        return {
+            'speculative_verify_score': float(score),
+            'speculative_verify_passed': bool(passed),
+            'speculative_verify_threshold': float(threshold),
+            'speculative_verifier_mode': 'latent_mse',
+            'segment_index': int(segment_index),
+        }
+
+
+    def _compare_action_with_real_obs(self, obs):
+        real_obs_chunk = obs.get('real_obs_chunk', None)
+        reference_action = obs.get('reference_action', None)
+        if real_obs_chunk is None or reference_action is None:
+            raise ValueError('compare_action_with_real_obs requires real_obs_chunk and reference_action')
+        self.transformer.clear_pred_cache(self.cache_name)
+        vae_feat_cache = [x.clone() if torch.is_tensor(x) else x for x in self.streaming_vae.feat_cache]
+        vae_half_feat_cache = None
+        if hasattr(self, 'streaming_vae_half'):
+            vae_half_feat_cache = [x.clone() if torch.is_tensor(x) else x for x in self.streaming_vae_half.feat_cache]
+        compare_obs = {'obs': real_obs_chunk}
+        try:
+            with torch.no_grad():
+                latent_model_input = self._encode_obs(compare_obs)
+        finally:
+            self.streaming_vae.feat_cache = vae_feat_cache
+            if vae_half_feat_cache is not None:
+                self.streaming_vae_half.feat_cache = vae_half_feat_cache
+
+        self._cache_pred_latent_chunk(
+            latent_model_input.to(self.device).to(self.dtype),
+            self.frame_st_id)
+        compare_action, profile = self._infer_action_only(frame_st_id=self.frame_st_id)
+        self.transformer.clear_pred_cache(self.cache_name)
+
+        reference_action = np.asarray(reference_action)
+        compare_action = np.asarray(compare_action)
+        common_shape = tuple(min(a, b) for a, b in zip(reference_action.shape, compare_action.shape))
+        slices = tuple(slice(0, n) for n in common_shape)
+        ref = reference_action[slices].astype(np.float32)
+        cmp = compare_action[slices].astype(np.float32)
+        diff = cmp - ref
+        ref_l2 = float(np.sqrt(np.mean(ref ** 2)) + 1e-8)
+        metrics = {
+            'shape': list(common_shape),
+            'abs_mean': float(np.mean(np.abs(diff))),
+            'abs_max': float(np.max(np.abs(diff))),
+            'rmse': float(np.sqrt(np.mean(diff ** 2))),
+            'rel_l2': float(np.sqrt(np.mean(diff ** 2)) / ref_l2),
+        }
+        logger.info(
+            f"[ActionCompare] frame_st_id={self.frame_st_id} "
+            f"abs_mean={metrics['abs_mean']:.6f} abs_max={metrics['abs_max']:.6f} "
+            f"rmse={metrics['rmse']:.6f} rel_l2={metrics['rel_l2']:.6f}"
+        )
+        return metrics, profile
+
     def _cache_pred_action_chunk(self, action, frame_st_id):
         profiler = self._new_latency_profiler()
         self.transformer.clear_pred_cache(self.cache_name)
@@ -700,6 +1298,24 @@ class VA_Server:
                     cache_name=self.cache_name,
                     action_mode=True)
         profile = profiler.summary('async_cache_current_action', frame_st_id=frame_st_id)
+        self._log_latency_profile(profile)
+        return profile
+
+    def _cache_pred_latent_chunk(self, latent_model_input, frame_st_id):
+        profiler = self._new_latency_profiler()
+        with profiler.record('sync_fdm.prepare_real_latent'):
+            input_dict = self._prepare_latent_input(
+                latent_model_input,
+                None,
+                frame_st_id=frame_st_id)
+        with torch.no_grad():
+            with profiler.record('sync_fdm.cache_real_latent'):
+                self.transformer(
+                    self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+                    update_cache=1,
+                    cache_name=self.cache_name,
+                    action_mode=False)
+        profile = profiler.summary('sync_fdm_cache_real_latent', frame_st_id=frame_st_id)
         self._log_latency_profile(profile)
         return profile
 
@@ -815,6 +1431,25 @@ class VA_Server:
         with profiler.record('kv.preprocess_action'):
             action_model_input = self.preprocess_action(obs['state'])
             action_model_input = action_model_input.to(latent_model_input)
+
+        if (getattr(self.job_config, 'sync_fdm_recompose_kv_cache', False)
+                and self.job_config.frame_chunk_size == 2
+                and self.frame_st_id > 0
+                and latent_model_input is not None
+                and latent_model_input.shape[2] >= 2):
+            real_first_latent = latent_model_input[:, :, 0:1].to(self.device).to(self.dtype)
+            self.transformer.clear_pred_cache(self.cache_name)
+            self._cache_pred_action_chunk(obs['state'], self.frame_st_id)
+            self._cache_pred_latent_chunk(real_first_latent, self.frame_st_id)
+            fdm_latents, _ = self._infer_fdm_video(self.frame_st_id)
+            fdm_second_latent = fdm_latents[:, :, 1:2].to(latent_model_input)
+            latent_model_input = torch.cat([latent_model_input[:, :, 0:1], fdm_second_latent], dim=2)
+            # latent_model_input = latent_model_input[:, :, 0:2]
+            self.transformer.clear_pred_cache(self.cache_name)
+            logger.info(
+                f"[SyncFDM] Recompose KV latent chunk with real first frame and FDM second frame at frame_st_id={self.frame_st_id}"
+            )
+
         logger.info(
             f"get KV cache obs: {latent_model_input.shape} {action_model_input.shape}"
         )
@@ -850,6 +1485,8 @@ class VA_Server:
         prompt = obs.get('prompt', None)
         compute_kv_cache = obs.get('compute_kv_cache', False)
         async_prefetch = obs.get('async_prefetch', False)
+        compare_action_with_real_obs = obs.get('compare_action_with_real_obs', False)
+        speculative_verify = obs.get('speculative_verify', False)
 
         if reset:
             logger.info(f"******************* Reset server ******************")
@@ -873,14 +1510,35 @@ class VA_Server:
             if profile:
                 result['profile_action_latency'] = profile
             return result
+        elif compare_action_with_real_obs:
+            logger.info(
+                f"################# Compare Action With Real Obs #################")
+            metrics, profile = self._compare_action_with_real_obs(obs)
+            result = dict(action_compare_metrics=metrics)
+            if profile:
+                result['profile_action_latency'] = profile
+            return result
+        elif speculative_verify:
+            logger.info(f"################# Speculative Verify #################")
+            return self._verify_speculative(obs)
         else:
+            if getattr(self.job_config, 'enable_speculative_verifier', False):
+                logger.info(f"################# Infer Speculative Draft #################")
+                return self._infer_speculative_draft(obs)
+
             logger.info(f"################# Infer One Chunk #################")
             action, _, profile, pred_video = self._infer(obs, frame_st_id=self.frame_st_id)
+            diversity_metrics = None
+            if getattr(self.job_config, 'enable_video_branch_action_diversity', False):
+                diversity_metrics = self._compute_video_branch_action_diversity(
+                    obs, frame_st_id=self.frame_st_id)
             result = dict(action=action)
             if pred_video is not None:
                 result['video'] = pred_video
             if profile:
                 result['profile_action_latency'] = profile
+            if diversity_metrics is not None:
+                result['video_branch_action_diversity_metrics'] = diversity_metrics
             return result
     
     def _decode_pred_video(self, latents):

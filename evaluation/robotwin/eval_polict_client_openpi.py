@@ -12,6 +12,23 @@ if str(lingbot_va_root) not in sys.path:
 
 from wan_va.configs.va_robotwin_cfg import va_robotwin_cfg
 
+ACTION_COMPARE_LOG_PATH = Path("/mnt/public/ns-t-te-b905754427352261-427-bk/fs/home/xieruiqi/Lingbot-VA-Customize/action_compare_w_real_obs.txt")
+
+def _write_action_compare_log(message):
+    ACTION_COMPARE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with ACTION_COMPARE_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(message + "\n")
+
+def _write_speculative_log(message):
+    log_path = Path(getattr(
+        va_robotwin_cfg,
+        'speculative_verifier_log_path',
+        "/mnt/public/ns-t-te-b905754427352261-427-bk/fs/home/xieruiqi/Lingbot-VA-Customize/speculative_verifier.txt",
+    ))
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(message + "\n")
+
 robowin_root = Path("/mnt/public/ns-t-te-b905754427352261-427-bk/fs/home/xieruiqi/RoboTwin")
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
@@ -603,6 +620,7 @@ def eval_policy(task_name,
         full_obs_list = []
         gen_video_list = []
         full_action_history = []
+        action_compare_metrics_list = []
         half_eval_reset_done = False
         half_eval_reset_step = TASK_ENV.step_lim // 2
 
@@ -615,12 +633,25 @@ def eval_policy(task_name,
         initial_formatted_obs = format_obs(initial_obs, prompt)
         full_obs_list.append(initial_formatted_obs)
         first_obs = None
-        async_enabled = getattr(va_robotwin_cfg, 'enable_async_inference', False)
+        current_real_obs = initial_formatted_obs
+        compare_action_enabled = getattr(va_robotwin_cfg, 'compare_action_with_real_obs', False)
+        action_without_future_video_enabled = getattr(
+            va_robotwin_cfg, 'enable_action_without_future_video', False)
+        speculative_enabled = getattr(va_robotwin_cfg, 'enable_speculative_verifier', False)
+        async_enabled = (
+            getattr(va_robotwin_cfg, 'enable_async_inference', False)
+            and not getattr(va_robotwin_cfg, 'sync_fdm_recompose_kv_cache', False)
+            and not compare_action_enabled
+            and not action_without_future_video_enabled
+            and not speculative_enabled
+        )
+        speculative_executed_chunk_steps = []
         async_executor = ThreadPoolExecutor(max_workers=1) if async_enabled else None
         async_future = None
         pending_feedback_obs = None
         pending_feedback_state = None
         current_ret = None
+        speculative_replan_full_denoise = False
         try:
             while TASK_ENV.take_action_cnt<TASK_ENV.step_lim:
                 if (reset_policy_at_half_eval_steps and not half_eval_reset_done
@@ -632,26 +663,172 @@ def eval_policy(task_name,
                     [reset_obs['endpose']['right_gripper']]
                     inint_eef_pose = np.array(inint_eef_pose, dtype=np.float64)
                     first_obs = format_obs(reset_obs, prompt)
+                    current_real_obs = first_obs
                     model.infer(dict(reset=True, prompt=prompt, save_visualization=save_visualization))
                     first = True
                     current_ret = None
                     pending_feedback_obs = None
                     pending_feedback_state = None
+                    speculative_replan_full_denoise = False
                     half_eval_reset_done = True
                     print(f"[EvalReset] Reset policy cache at step {TASK_ENV.take_action_cnt}/{TASK_ENV.step_lim}")
 
                 if first:
                     observation = TASK_ENV.get_obs()
                     first_obs = format_obs(observation, prompt)
+                    current_real_obs = first_obs
 
                 if current_ret is None:
-                    current_ret = model.infer(dict(obs=first_obs, prompt=prompt, save_visualization=save_visualization, video_guidance_scale=video_guidance_scale, action_guidance_scale=action_guidance_scale)) #(TASK_ENV, model, observation)
+                    infer_payload = dict(
+                        obs=first_obs,
+                        prompt=prompt,
+                        save_visualization=save_visualization,
+                        video_guidance_scale=video_guidance_scale,
+                        action_guidance_scale=action_guidance_scale,
+                    )
+                    if speculative_enabled:
+                        infer_payload['speculative_full_denoise'] = speculative_replan_full_denoise
+                        if speculative_replan_full_denoise:
+                            _write_speculative_log(
+                                f"[SpeculativeVerifier] full-denoise replan requested episode={now_seed} infer={infer_idx}"
+                            )
+                    current_ret = model.infer(infer_payload) #(TASK_ENV, model, observation)
+                    if speculative_enabled:
+                        _write_speculative_log(
+                            f"[SpeculativeVerifier] draft episode={now_seed} infer={infer_idx} "
+                            f"full_denoise={current_ret.get('speculative_full_denoise_replan', False)} "
+                            f"video_steps={current_ret.get('speculative_video_num_inference_steps_used', 'NA')} "
+                            f"action_steps={current_ret.get('speculative_action_num_inference_steps_used', 'NA')} "
+                            f"future_chunk={current_ret.get('speculative_replan_frame_chunk_size_used', 'NA')} "
+                            f"draft_chunk={current_ret.get('speculative_draft_frame_chunk_size', 'NA')}"
+                        )
+                    speculative_replan_full_denoise = False
                     if print_profile:
                         _print_profile(current_ret, now_seed, infer_idx)
                 action = current_ret['action']
                 if 'video' in current_ret:
                     imagined_video = current_ret['video']
                     gen_video_list.append(imagined_video)
+
+                if speculative_enabled:
+                    pred_latents = current_ret.get('speculative_pred_latents', None)
+                    if pred_latents is None:
+                        raise RuntimeError('Speculative verifier mode requires speculative_pred_latents from server')
+                    pred_latents = np.asarray(pred_latents)
+                    segment_action_steps = int(getattr(
+                        va_robotwin_cfg, 'speculative_segment_action_steps', va_robotwin_cfg.action_per_frame))
+                    if action.shape[2] != segment_action_steps:
+                        _write_speculative_log(
+                            f"[SpeculativeVerifier] action_per_frame_mismatch expected={segment_action_steps} actual={action.shape[2]}"
+                        )
+                        segment_action_steps = action.shape[2]
+
+                    was_first = first
+                    first = False
+                    start_idx = 1 if was_first else 0
+                    executed_steps_this_draft = 0
+                    current_ret = None
+
+                    for i in range(start_idx, action.shape[1]):
+                        segment_action = action[:, i:i + 1, :]
+                        segment_obs_list = []
+                        # Match the original RoboTwin feedback path: one model action frame
+                        # is represented by 4 real observations for VAE temporal encoding.
+                        obs_sample_stride = max(1, action.shape[2] // 4)
+                        for j in range(action.shape[2]):
+                            raw_action_step = action[:, i, j].flatten()
+                            full_action_history.append(raw_action_step)
+
+                            ee_action = action[:, i, j]
+                            if action.shape[0] == 14:
+                                ee_action = np.concatenate([
+                                    ee_action[:3],
+                                    euler2quat(ee_action[3], ee_action[4], ee_action[5]),
+                                    ee_action[6:10],
+                                    euler2quat(ee_action[10], ee_action[11], ee_action[12]),
+                                    ee_action[13:14]
+                                ])
+                            elif action.shape[0] == 16:
+                                ee_action = add_init_pose(ee_action, inint_eef_pose)
+                                ee_action = np.concatenate([
+                                    ee_action[:3],
+                                    ee_action[3:7] / np.linalg.norm(ee_action[3:7]),
+                                    ee_action[7:11],
+                                    ee_action[11:15] / np.linalg.norm(ee_action[11:15]),
+                                    ee_action[15:16]
+                                ])
+                            else:
+                                raise NotImplementedError
+                            TASK_ENV.take_action(ee_action, action_type='ee')
+
+                            if (j + 1) % obs_sample_stride == 0:
+                                obs = format_obs(TASK_ENV.get_obs(), prompt)
+                                full_obs_list.append(obs)
+                                segment_obs_list.append(obs)
+
+                        if not segment_obs_list:
+                            real_obs = format_obs(TASK_ENV.get_obs(), prompt)
+                            full_obs_list.append(real_obs)
+                            segment_obs_list.append(real_obs)
+                        real_obs = segment_obs_list[-1]
+                        current_real_obs = real_obs
+                        executed_steps_this_draft += action.shape[2]
+
+                        next_frame_idx = i + 1
+                        if next_frame_idx < action.shape[1] and next_frame_idx < pred_latents.shape[2]:
+                            verify_ret = model.infer(dict(
+                                speculative_verify=True,
+                                obs=segment_obs_list,
+                                pred_latent=pred_latents[:, :, next_frame_idx:next_frame_idx + 1],
+                                draft_action=action[:, next_frame_idx:next_frame_idx + 1, :],
+                                segment_index=int(next_frame_idx),
+                                verify_frame_offset=int(next_frame_idx),
+                            ))
+                            score = float(verify_ret.get('speculative_verify_score', 0.0))
+                            passed = bool(verify_ret.get('speculative_verify_passed', False))
+                            _write_speculative_log(
+                                f"[SpeculativeVerifier] episode={now_seed} infer={infer_idx} "
+                                f"executed_segment={i} verify_segment={next_frame_idx} "
+                                f"executed_steps={executed_steps_this_draft} score={score:.6f} passed={passed}"
+                            )
+                        else:
+                            score = float('nan')
+                            passed = True
+                            _write_speculative_log(
+                                f"[SpeculativeVerifier] episode={now_seed} infer={infer_idx} "
+                                f"executed_segment={i} skip_verify_no_next_draft_frame=True "
+                                f"executed_steps={executed_steps_this_draft}"
+                            )
+
+                        ret = model.infer(dict(
+                            obs=segment_obs_list,
+                            compute_kv_cache=True,
+                            imagine=False,
+                            save_visualization=save_visualization,
+                            state=segment_action,
+                        ))
+                        if print_profile:
+                            _print_profile(ret, now_seed, infer_idx)
+                        infer_idx += 1
+
+                        if TASK_ENV.eval_success:
+                            succ = True
+                            break
+                        if not passed:
+                            speculative_replan_full_denoise = True
+                            _write_speculative_log(
+                                f"[SpeculativeVerifier] reject episode={now_seed} infer={infer_idx} "
+                                f"segment={i} score={score:.6f}; next_replan_full_denoise=True"
+                            )
+                            break
+
+                    if executed_steps_this_draft > 0:
+                        speculative_executed_chunk_steps.append(executed_steps_this_draft)
+                    if TASK_ENV.eval_success:
+                        break
+                    continue
+
+                pre_action_obs = current_real_obs
 
                 if async_enabled and not first:
                     async_future = _start_async_prefetch(
@@ -705,6 +882,31 @@ def eval_policy(task_name,
                 was_first = first
                 first = False
 
+                post_action_obs = key_frame_list[-1] if key_frame_list else pre_action_obs
+                if compare_action_enabled and not async_enabled and len(key_frame_list) > 0:
+                    compare_ret = model.infer(dict(
+                        compare_action_with_real_obs=True,
+                        real_obs_chunk=key_frame_list,
+                        reference_action=action,
+                    ))
+                    metrics = compare_ret.get('action_compare_metrics', {})
+                    if metrics:
+                        metrics = dict(metrics)
+                        metrics.update({
+                            'seed': int(now_seed),
+                            'infer_idx': int(infer_idx),
+                            'take_action_cnt': int(TASK_ENV.take_action_cnt),
+                        })
+                        action_compare_metrics_list.append(metrics)
+                        _write_action_compare_log(
+                            f"[ActionCompare] episode={now_seed} infer={infer_idx} "
+                            f"abs_mean={metrics.get('abs_mean', 0):.6f} "
+                            f"abs_max={metrics.get('abs_max', 0):.6f} "
+                            f"rmse={metrics.get('rmse', 0):.6f} "
+                            f"rel_l2={metrics.get('rel_l2', 0):.6f}"
+                        )
+                current_real_obs = post_action_obs
+
                 infer_idx += 1
                 if async_enabled and not was_first:
                     current_ret = async_future.result()
@@ -748,6 +950,35 @@ def eval_policy(task_name,
         if TASK_ENV.eval_video_path is not None:
             TASK_ENV._del_eval_video_ffmpeg()
 
+        action_compare_summary = None
+        if action_compare_metrics_list:
+            summary_keys = ['abs_mean', 'abs_max', 'rmse', 'rel_l2']
+            action_compare_summary = {
+                key: float(np.mean([m[key] for m in action_compare_metrics_list if key in m]))
+                for key in summary_keys
+            }
+            action_compare_summary['count'] = int(len(action_compare_metrics_list))
+            _write_action_compare_log(
+                f"[ActionCompareSummary] episode={now_seed} count={action_compare_summary['count']} "
+                f"avg_abs_mean={action_compare_summary['abs_mean']:.6f} "
+                f"avg_abs_max={action_compare_summary['abs_max']:.6f} "
+                f"avg_rmse={action_compare_summary['rmse']:.6f} "
+                f"avg_rel_l2={action_compare_summary['rel_l2']:.6f}"
+            )
+        elif compare_action_enabled:
+            _write_action_compare_log(
+                f"[ActionCompareSummary] episode={now_seed} count=0 "
+                f"no real future obs collected; need len(key_frame_list)>0"
+            )
+
+        if speculative_enabled and speculative_executed_chunk_steps:
+            avg_chunk_steps = float(np.mean(speculative_executed_chunk_steps))
+            _write_speculative_log(
+                f"[SpeculativeVerifierSummary] episode={now_seed} chunks={len(speculative_executed_chunk_steps)} "
+                f"avg_executed_action_steps={avg_chunk_steps:.2f} "
+                f"values={speculative_executed_chunk_steps}"
+            )
+
         if succ:
             TASK_ENV.suc += 1
             print("\033[92mSuccess!\033[0m")
@@ -770,6 +1001,14 @@ def eval_policy(task_name,
           "total_num": float(TASK_ENV.test_num),
           "succ_rate": float(TASK_ENV.suc / TASK_ENV.test_num),
         }, out_json_file)
+        if action_compare_metrics_list:
+            compare_json_file = save_dir / f"action_compare_episode{TASK_ENV.test_num}.json"
+            write_json({
+                "prompt": prompt,
+                "success": bool(succ),
+                "summary": action_compare_summary,
+                "metrics": action_compare_metrics_list,
+            }, compare_json_file)
 
         print(
             f"\033[93m{task_name}\033[0m | \033[94m{args['policy_name']}\033[0m | \033[92m{args['task_config']}\033[0m | \033[91m{args['ckpt_setting']}\033[0m\n"

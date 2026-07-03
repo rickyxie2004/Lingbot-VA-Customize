@@ -365,7 +365,7 @@ if __name__ == '__main__':
     from wan_va.configs import VA_CONFIGS
     from tqdm import tqdm
     dset = MultiLatentLeRobotDataset(
-        VA_CONFIGS['demo_train']
+        VA_CONFIGS['robotwin_train']
     )
     for key, value in dset[0].items():
         if isinstance(value, torch.Tensor):
@@ -386,6 +386,7 @@ if __name__ == '__main__':
     for data in tqdm(dloader):
         _, _, F, H, W = data['latents'].shape
         max_l = max(max_l, F*H*W)
+        import ipdb; ipdb.set_trace()
         action_list.append(data['actions'].flatten(2).permute(0, 2, 1).flatten(0, 1))
     action_all = torch.cat(action_list, dim=0)
     print(max_l)

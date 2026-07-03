@@ -7,7 +7,7 @@ va_robotwin_cfg = EasyDict(__name__='Config: VA robotwin')
 va_robotwin_cfg.update(va_shared_cfg)
 
 va_robotwin_cfg.wan22_pretrained_model_name_or_path = "/mnt/public/xieruiqi/models/lingbot-va/robotwin"
-va_robotwin_cfg.trained_transformer_path = "/mnt/public/ns-t-te-b905754427352261-427-bk/fs/home/xieruiqi/lingbot-va/train_out/checkpoints/checkpoint_step_9000"
+# va_robotwin_cfg.trained_transformer_path = "/mnt/public/ns-t-te-b905754427352261-427-bk/fs/home/xieruiqi/lingbot-va_0607/train_out/checkpoints/checkpoint_step_9000"
 
 va_robotwin_cfg.attn_window = 72
 va_robotwin_cfg.frame_chunk_size = 2
@@ -25,9 +25,29 @@ va_robotwin_cfg.guidance_scale = 1
 va_robotwin_cfg.action_guidance_scale = 1
 
 va_robotwin_cfg.num_inference_steps = 3
-va_robotwin_cfg.video_exec_step = -1
-va_robotwin_cfg.enable_async_inference = True
 va_robotwin_cfg.action_num_inference_steps = 3
+# Analyze Exp
+va_robotwin_cfg.video_exec_step = -1
+
+va_robotwin_cfg.enable_async_inference = False
+va_robotwin_cfg.sync_fdm_recompose_kv_cache = False
+va_robotwin_cfg.compare_action_with_real_obs = False
+va_robotwin_cfg.enable_action_without_future_video = False
+
+va_robotwin_cfg.enable_video_branch_action_diversity = False
+va_robotwin_cfg.video_branch_action_diversity_num = 8
+# Speculative
+va_robotwin_cfg.enable_speculative_verifier = True
+va_robotwin_cfg.speculative_frame_chunk_size = 4
+va_robotwin_cfg.speculative_replan_frame_chunk_size = 2
+va_robotwin_cfg.speculative_video_num_inference_steps = 5
+va_robotwin_cfg.speculative_action_num_inference_steps = 3
+va_robotwin_cfg.speculative_segment_action_steps = 16
+va_robotwin_cfg.speculative_verifier_mode = "action_denoise"
+va_robotwin_cfg.speculative_verifier_action_noise_sigma = 0.3
+va_robotwin_cfg.speculative_verifier_threshold = 0.01
+va_robotwin_cfg.speculative_verifier_log_path = "/mnt/public/ns-t-te-b905754427352261-427-bk/fs/home/xieruiqi/Lingbot-VA-Customize/speculative_verifier.txt"
+va_robotwin_cfg.video_branch_action_diversity_log_path = "/mnt/public/ns-t-te-b905754427352261-427-bk/fs/home/xieruiqi/Lingbot-VA-Customize/video_branch_action_diversity.txt"
 va_robotwin_cfg.reset_policy_at_half_eval_steps = False
 
 va_robotwin_cfg.snr_shift = 5.0
