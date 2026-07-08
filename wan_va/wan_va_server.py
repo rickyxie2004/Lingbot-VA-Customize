@@ -389,6 +389,43 @@ class VA_Server:
             if block.attn1.attn_caches is not None:
                 block.attn1.attn_caches[self.cache_name] = cache
 
+    def _clone_runtime_state(self):
+        vae_half_feat_cache = None
+        if hasattr(self, 'streaming_vae_half'):
+            vae_half_feat_cache = [
+                x.clone() if torch.is_tensor(x) else x
+                for x in self.streaming_vae_half.feat_cache
+            ]
+        return {
+            'transformer_cache': self._clone_transformer_cache(),
+            'vae_feat_cache': [
+                x.clone() if torch.is_tensor(x) else x
+                for x in self.streaming_vae.feat_cache
+            ],
+            'vae_half_feat_cache': vae_half_feat_cache,
+            'init_latent': self.init_latent.clone() if torch.is_tensor(self.init_latent) else self.init_latent,
+            'latest_real_latent': (
+                self.latest_real_latent.clone()
+                if torch.is_tensor(getattr(self, 'latest_real_latent', None))
+                else getattr(self, 'latest_real_latent', None)
+            ),
+            'frame_st_id': int(self.frame_st_id),
+            'torch_rng_state': torch.get_rng_state(),
+            'cuda_rng_state': torch.cuda.get_rng_state(self.device) if torch.cuda.is_available() else None,
+        }
+
+    def _restore_runtime_state(self, state_snapshot):
+        self._restore_transformer_cache(state_snapshot['transformer_cache'])
+        self.streaming_vae.feat_cache = state_snapshot['vae_feat_cache']
+        if state_snapshot['vae_half_feat_cache'] is not None:
+            self.streaming_vae_half.feat_cache = state_snapshot['vae_half_feat_cache']
+        self.init_latent = state_snapshot['init_latent']
+        self.latest_real_latent = state_snapshot.get('latest_real_latent', None)
+        self.frame_st_id = state_snapshot['frame_st_id']
+        torch.set_rng_state(state_snapshot['torch_rng_state'])
+        if state_snapshot['cuda_rng_state'] is not None:
+            torch.cuda.set_rng_state(state_snapshot['cuda_rng_state'], self.device)
+
     def _expand_transformer_cache_batch(self, batch_size):
         cache_batch_size = batch_size * (2 if self.use_cfg else 1)
         for block in self.transformer.blocks:
@@ -548,6 +585,7 @@ class VA_Server:
         #### Reset all parameters
         self.frame_st_id = 0
         self.init_latent = None
+        self.latest_real_latent = None
         #### clean vae and transformer cache
         self.transformer.clear_cache(self.cache_name)
         self.streaming_vae.clear_cache()
@@ -646,13 +684,21 @@ class VA_Server:
         video_num_inference_steps=None,
         action_num_inference_steps=None,
         frame_chunk_size=None,
+        save_outputs=True,
+        decode_video=True,
+        reuse_init_latent=False,
     ):
         profiler = self._new_latency_profiler()
         frame_chunk_size = int(frame_chunk_size or self.job_config.frame_chunk_size)
         if frame_st_id == 0:
-            with profiler.record('obs.encode'):
-                init_latent = self._encode_obs(obs)
-            self.init_latent = init_latent
+            if reuse_init_latent and self.init_latent is not None:
+                init_latent = self.init_latent
+            else:
+                with profiler.record('obs.encode'):
+                    init_latent = self._encode_obs(obs)
+                self.init_latent = init_latent
+            if torch.is_tensor(init_latent):
+                self.latest_real_latent = init_latent[:, :, -1:].detach().clone()
 
         with profiler.record('noise.init'):
             latents = torch.randn(1,
@@ -790,14 +836,16 @@ class VA_Server:
         with profiler.record('action.mask'):
             actions[:, ~self.action_mask] *= 0
 
-        save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
-        save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
+        if save_outputs:
+            save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
+            save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
 
         with profiler.record('action.postprocess'):
             actions = self.postprocess_action(actions)
         pred_video = None
-        with profiler.record('video.decode'):
-            pred_video = self._decode_pred_video(latents)
+        if decode_video:
+            with profiler.record('video.decode'):
+                pred_video = self._decode_pred_video(latents)
         with profiler.record('cuda.empty_cache'):
             torch.cuda.empty_cache()
 
@@ -1068,6 +1116,7 @@ class VA_Server:
             video_num_inference_steps=video_steps,
             action_num_inference_steps=action_steps,
             frame_chunk_size=frame_chunk_size,
+            reuse_init_latent=(self.frame_st_id == 0 and self.init_latent is not None),
         )
         # Do not let speculative future tokens become committed history.
         self.transformer.clear_pred_cache(self.cache_name)
@@ -1089,6 +1138,18 @@ class VA_Server:
             result['profile_action_latency'] = profile
         return result
 
+    def _get_current_latent_for_verifier(self, real_obs_list):
+        if len(real_obs_list) >= 4:
+            real_latent = self._encode_obs_preserve_vae_cache({'obs': real_obs_list})
+            return real_latent[:, :, -1:].to(self.device).to(self.dtype)
+        cached_latent = getattr(self, 'latest_real_latent', None)
+        if torch.is_tensor(cached_latent):
+            return cached_latent[:, :, -1:].to(self.device).to(self.dtype)
+        if torch.is_tensor(self.init_latent):
+            return self.init_latent[:, :, -1:].to(self.device).to(self.dtype)
+        real_latent = self._encode_obs_preserve_vae_cache({'obs': real_obs_list})
+        return real_latent[:, :, -1:].to(self.device).to(self.dtype)
+
     def _to_single_frame_pred_latent(self, pred_latent, ref_latent):
         pred_latent = torch.from_numpy(np.asarray(pred_latent)).to(
             device=ref_latent.device, dtype=ref_latent.dtype)
@@ -1106,7 +1167,110 @@ class VA_Server:
             return self._verify_speculative_latent(obs)
         if mode == 'action_denoise':
             return self._verify_speculative_action_denoise(obs)
+        if mode == 'oracle_chunk1_action':
+            return self._verify_speculative_oracle_chunk1_action(obs)
         raise ValueError(f'Unknown speculative_verifier_mode: {mode}')
+
+    def _verify_speculative_oracle_chunk1_action(self, obs):
+        real_obs = obs.get('obs', None)
+        draft_action = obs.get('draft_action', None)
+        executed_action = obs.get('executed_action', None)
+        oracle_preverify = bool(obs.get('oracle_preverify', False))
+        segment_index = int(obs.get('segment_index', -1))
+        if real_obs is None or draft_action is None:
+            raise ValueError('oracle_chunk1_action speculative_verify requires obs and draft_action')
+        if not oracle_preverify and executed_action is None:
+            raise ValueError('post-execution oracle_chunk1_action speculative_verify requires executed_action')
+
+        real_obs_list = real_obs if isinstance(real_obs, list) else [real_obs]
+        oracle_chunk_size = int(getattr(self.job_config, 'speculative_oracle_action_chunk_size', 1))
+        oracle_chunk_size = max(1, oracle_chunk_size)
+        threshold = float(getattr(
+            self.job_config, 'speculative_oracle_action_threshold', -1))
+        if threshold < 0:
+            threshold = float(getattr(self.job_config, 'speculative_verifier_threshold', 0.5))
+
+        state_snapshot = self._clone_runtime_state()
+        oracle_compare_idx = 0
+        try:
+            if oracle_preverify:
+                oracle_frame_st_id = self.frame_st_id
+                oracle_infer_chunk_size = oracle_chunk_size + 1 if self.frame_st_id == 0 else oracle_chunk_size
+                oracle_compare_idx = 1 if self.frame_st_id == 0 else 0
+            else:
+                # Temporarily commit the latest real feedback and the clean action that was actually executed.
+                self._compute_kv_cache({
+                    'obs': real_obs_list,
+                    'state': executed_action,
+                    'save_kv_debug': False,
+                })
+                oracle_frame_st_id = self.frame_st_id
+                oracle_infer_chunk_size = oracle_chunk_size
+            oracle_action, _, _, _ = self._infer(
+                {'obs': real_obs_list},
+                frame_st_id=oracle_frame_st_id,
+                video_num_inference_steps=self.job_config.num_inference_steps,
+                action_num_inference_steps=self.job_config.action_num_inference_steps,
+                frame_chunk_size=oracle_infer_chunk_size,
+                save_outputs=False,
+                decode_video=False,
+                reuse_init_latent=oracle_preverify,
+            )
+        finally:
+            self._restore_runtime_state(state_snapshot)
+
+        draft_action = np.asarray(draft_action, dtype=np.float32)
+        oracle_action = np.asarray(oracle_action, dtype=np.float32)
+        draft_chunk = draft_action[:, 0, :] if draft_action.ndim == 3 else draft_action
+        if oracle_action.ndim == 3:
+            if oracle_compare_idx >= oracle_action.shape[1]:
+                oracle_compare_idx = 0
+            oracle_action_chunk = oracle_action[:, oracle_compare_idx:oracle_compare_idx + oracle_chunk_size, :]
+            if oracle_action_chunk.shape[1] == 0:
+                oracle_action_chunk = oracle_action[:, :1, :]
+            oracle_chunk = oracle_action_chunk[:, 0, :]
+        else:
+            oracle_chunk = oracle_action
+            oracle_action_chunk = oracle_action[:, None, :]
+        common_shape = tuple(min(a, b) for a, b in zip(draft_chunk.shape, oracle_chunk.shape))
+        slices = tuple(slice(0, n) for n in common_shape)
+        draft_chunk = draft_chunk[slices]
+        oracle_chunk = oracle_chunk[slices]
+        diff = draft_chunk - oracle_chunk
+        score = float(np.sqrt(np.mean(diff ** 2)))
+        passed = bool(score < threshold)
+        ref_l2 = float(np.sqrt(np.mean(oracle_chunk ** 2)) + 1e-8)
+        rel_l2 = float(score / ref_l2)
+        abs_mean = float(np.mean(np.abs(diff)))
+        abs_max = float(np.max(np.abs(diff)))
+
+        message = (
+            f"[SpeculativeVerifier] mode=oracle_chunk1_action preverify={oracle_preverify} "
+            f"frame_st_id={self.frame_st_id} segment={segment_index} score_rmse={score:.6f} "
+            f"threshold={threshold:.6f} passed={passed} oracle_chunk={oracle_chunk_size} "
+            f"oracle_compare_idx={oracle_compare_idx} shape={list(common_shape)} "
+            f"abs_mean={abs_mean:.6f} abs_max={abs_max:.6f} rel_l2={rel_l2:.6f}"
+        )
+        logger.info(message)
+        log_path = getattr(self.job_config, 'speculative_verifier_log_path', None)
+        if log_path:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(message + '\n')
+        return {
+            'speculative_verify_score': float(score),
+            'speculative_verify_passed': bool(passed),
+            'speculative_verify_threshold': float(threshold),
+            'speculative_verifier_mode': 'oracle_chunk1_action',
+            'segment_index': int(segment_index),
+            'oracle_preverify': bool(oracle_preverify),
+            'oracle_compare_idx': int(oracle_compare_idx),
+            'oracle_action_chunk': oracle_action_chunk.astype(np.float32),
+            'oracle_action_chunk_size': int(oracle_action_chunk.shape[1]),
+            'oracle_abs_mean': abs_mean,
+            'oracle_abs_max': abs_max,
+            'oracle_rel_l2': rel_l2,
+        }
 
     def _verify_speculative_action_denoise(self, obs):
         real_obs = obs.get('obs', None)
@@ -1119,8 +1283,7 @@ class VA_Server:
             raise ValueError('action_denoise speculative_verify requires obs, pred_latent, and draft_action')
 
         real_obs_list = real_obs if isinstance(real_obs, list) else [real_obs]
-        real_latent = self._encode_obs_preserve_vae_cache({'obs': real_obs_list})
-        current_latent = real_latent[:, :, -1:].to(self.device).to(self.dtype)
+        current_latent = self._get_current_latent_for_verifier(real_obs_list)
         pred_latent = self._to_single_frame_pred_latent(pred_latent, current_latent)
         latent_condition = torch.cat([current_latent, pred_latent], dim=2)
 
@@ -1420,13 +1583,16 @@ class VA_Server:
         profiler = self._new_latency_profiler()
         ### optional async save obs for debug
         self.transformer.clear_pred_cache(self.cache_name)
-        save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
+        if obs.get('save_kv_debug', True):
+            save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
         with profiler.record('kv.obs_encode'):
             latent_model_input = self._encode_obs(obs)
         if self.frame_st_id == 0:
             latent_model_input = torch.cat(
                 [self.init_latent, latent_model_input],
                 dim=2) if latent_model_input is not None else self.init_latent
+        if torch.is_tensor(latent_model_input):
+            self.latest_real_latent = latent_model_input[:, :, -1:].detach().clone()
 
         with profiler.record('kv.preprocess_action'):
             action_model_input = self.preprocess_action(obs['state'])
@@ -1479,6 +1645,69 @@ class VA_Server:
         self.frame_st_id += latent_model_input.shape[2]
         return profile
 
+    def _compute_chunk_size_action_compare_metrics(self, reference_action, alt_action, frame_st_id, reference_chunk_size, alt_chunk_size):
+        reference_action = np.asarray(reference_action, dtype=np.float32)
+        alt_action = np.asarray(alt_action, dtype=np.float32)
+        if reference_action.ndim != 3 or alt_action.ndim != 3:
+            raise ValueError('chunk size action compare expects actions with shape [C, F, H]')
+        compare_frame_idx = 1 if frame_st_id == 0 and reference_action.shape[1] > 1 and alt_action.shape[1] > 1 else 0
+        if compare_frame_idx >= reference_action.shape[1] or compare_frame_idx >= alt_action.shape[1]:
+            compare_frame_idx = 0
+        reference_chunk = reference_action[:, compare_frame_idx, :]
+        alt_chunk = alt_action[:, compare_frame_idx, :]
+        common_shape = tuple(min(a, b) for a, b in zip(reference_chunk.shape, alt_chunk.shape))
+        slices = tuple(slice(0, n) for n in common_shape)
+        reference_chunk = reference_chunk[slices]
+        alt_chunk = alt_chunk[slices]
+        diff = alt_chunk - reference_chunk
+        ref_l2 = float(np.sqrt(np.mean(reference_chunk ** 2)) + 1e-8)
+        metrics = {
+            'frame_st_id': int(frame_st_id),
+            'reference_chunk_size': int(reference_chunk_size),
+            'alt_chunk_size': int(alt_chunk_size),
+            'compare_frame_idx': int(compare_frame_idx),
+            'shape': list(common_shape),
+            'abs_mean': float(np.mean(np.abs(diff))),
+            'abs_max': float(np.max(np.abs(diff))),
+            'rmse': float(np.sqrt(np.mean(diff ** 2))),
+            'rel_l2': float(np.sqrt(np.mean(diff ** 2)) / ref_l2),
+        }
+        message = (
+            f"[ChunkSizeActionCompare] frame_st_id={metrics['frame_st_id']} "
+            f"ref_chunk={metrics['reference_chunk_size']} alt_chunk={metrics['alt_chunk_size']} "
+            f"compare_frame_idx={metrics['compare_frame_idx']} shape={metrics['shape']} "
+            f"abs_mean={metrics['abs_mean']:.6f} abs_max={metrics['abs_max']:.6f} "
+            f"rmse={metrics['rmse']:.6f} rel_l2={metrics['rel_l2']:.6f}"
+        )
+        logger.info(message)
+        log_path = getattr(self.job_config, 'chunk_size_action_compare_log_path', None)
+        if log_path:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(message + '\n')
+        return metrics
+
+    def _compare_action_chunk_size_inference(self, obs, reference_action, frame_st_id, reference_chunk_size):
+        alt_chunk_size = int(getattr(self.job_config, 'chunk_size_action_compare_alt_frame_chunk_size', 4))
+        if alt_chunk_size <= 0 or alt_chunk_size == reference_chunk_size:
+            return None
+        state_before_alt = self._clone_runtime_state()
+        try:
+            self.transformer.clear_pred_cache(self.cache_name)
+            alt_action, _, _, _ = self._infer(
+                obs,
+                frame_st_id=frame_st_id,
+                video_num_inference_steps=self.job_config.num_inference_steps,
+                action_num_inference_steps=self.job_config.action_num_inference_steps,
+                frame_chunk_size=alt_chunk_size,
+                save_outputs=False,
+                decode_video=False,
+            )
+            return self._compute_chunk_size_action_compare_metrics(
+                reference_action, alt_action, frame_st_id, reference_chunk_size, alt_chunk_size)
+        finally:
+            self._restore_runtime_state(state_before_alt)
+
     @torch.no_grad()
     def infer(self, obs):
         reset = obs.get('reset', False)
@@ -1522,16 +1751,29 @@ class VA_Server:
             logger.info(f"################# Speculative Verify #################")
             return self._verify_speculative(obs)
         else:
-            if getattr(self.job_config, 'enable_speculative_verifier', False):
+            chunk_size_compare_enabled = getattr(self.job_config, 'enable_chunk_size_action_compare', False)
+            if getattr(self.job_config, 'enable_speculative_verifier', False) and not chunk_size_compare_enabled:
                 logger.info(f"################# Infer Speculative Draft #################")
                 return self._infer_speculative_draft(obs)
 
             logger.info(f"################# Infer One Chunk #################")
-            action, _, profile, pred_video = self._infer(obs, frame_st_id=self.frame_st_id)
+            frame_st_id = self.frame_st_id
+            reference_chunk_size = int(self.job_config.frame_chunk_size)
+            state_before_main = self._clone_runtime_state() if chunk_size_compare_enabled else None
+            action, _, profile, pred_video = self._infer(obs, frame_st_id=frame_st_id)
+            chunk_size_compare_metrics = None
+            if chunk_size_compare_enabled:
+                state_after_main = self._clone_runtime_state()
+                try:
+                    self._restore_runtime_state(state_before_main)
+                    chunk_size_compare_metrics = self._compare_action_chunk_size_inference(
+                        obs, action, frame_st_id, reference_chunk_size)
+                finally:
+                    self._restore_runtime_state(state_after_main)
             diversity_metrics = None
             if getattr(self.job_config, 'enable_video_branch_action_diversity', False):
                 diversity_metrics = self._compute_video_branch_action_diversity(
-                    obs, frame_st_id=self.frame_st_id)
+                    obs, frame_st_id=frame_st_id)
             result = dict(action=action)
             if pred_video is not None:
                 result['video'] = pred_video
@@ -1539,6 +1781,8 @@ class VA_Server:
                 result['profile_action_latency'] = profile
             if diversity_metrics is not None:
                 result['video_branch_action_diversity_metrics'] = diversity_metrics
+            if chunk_size_compare_metrics is not None:
+                result['chunk_size_action_compare_metrics'] = chunk_size_compare_metrics
             return result
     
     def _decode_pred_video(self, latents):

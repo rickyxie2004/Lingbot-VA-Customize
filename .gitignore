@@ -3,3 +3,4 @@ outputs/
 visualization/
 train_out/
 *.egg-info/
+*.txt

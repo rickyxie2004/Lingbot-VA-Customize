@@ -638,6 +638,15 @@ def eval_policy(task_name,
         action_without_future_video_enabled = getattr(
             va_robotwin_cfg, 'enable_action_without_future_video', False)
         speculative_enabled = getattr(va_robotwin_cfg, 'enable_speculative_verifier', False)
+        speculative_verifier_mode = getattr(va_robotwin_cfg, 'speculative_verifier_mode', '')
+        oracle_preverify_enabled = (
+            speculative_enabled
+            and speculative_verifier_mode == 'oracle_chunk1_action'
+        )
+        action_denoise_first_verify_enabled = (
+            speculative_enabled
+            and speculative_verifier_mode == 'action_denoise'
+        )
         async_enabled = (
             getattr(va_robotwin_cfg, 'enable_async_inference', False)
             and not getattr(va_robotwin_cfg, 'sync_fdm_recompose_kv_cache', False)
@@ -693,7 +702,10 @@ def eval_policy(task_name,
                                 f"[SpeculativeVerifier] full-denoise replan requested episode={now_seed} infer={infer_idx}"
                             )
                     current_ret = model.infer(infer_payload) #(TASK_ENV, model, observation)
+                    current_draft_full_denoise_replan = False
                     if speculative_enabled:
+                        current_draft_full_denoise_replan = bool(
+                            current_ret.get('speculative_full_denoise_replan', False))
                         _write_speculative_log(
                             f"[SpeculativeVerifier] draft episode={now_seed} infer={infer_idx} "
                             f"full_denoise={current_ret.get('speculative_full_denoise_replan', False)} "
@@ -729,42 +741,128 @@ def eval_policy(task_name,
                     executed_steps_this_draft = 0
                     current_ret = None
 
-                    for i in range(start_idx, action.shape[1]):
+                    i = start_idx
+                    while i < action.shape[1]:
                         segment_action = action[:, i:i + 1, :]
+                        execute_full_replan_chunk = (
+                            action_denoise_first_verify_enabled
+                            and current_draft_full_denoise_replan
+                        )
+                        executed_action = action[:, i:, :] if execute_full_replan_chunk else segment_action
+                        oracle_override = False
+                        if oracle_preverify_enabled:
+                            verify_ret = model.infer(dict(
+                                speculative_verify=True,
+                                oracle_preverify=True,
+                                obs=current_real_obs,
+                                draft_action=segment_action,
+                                segment_index=int(i),
+                                verify_frame_offset=int(i),
+                            ))
+                            score = float(verify_ret.get('speculative_verify_score', 0.0))
+                            passed = bool(verify_ret.get('speculative_verify_passed', False))
+                            _write_speculative_log(
+                                f"[SpeculativeVerifier] episode={now_seed} infer={infer_idx} "
+                                f"preverify_segment={i} executed_steps={executed_steps_this_draft} "
+                                f"score={score:.6f} passed={passed}"
+                            )
+                            if not passed:
+                                oracle_action_chunk = verify_ret.get('oracle_action_chunk', None)
+                                if oracle_action_chunk is None:
+                                    raise RuntimeError('oracle_chunk1_action verifier failed but did not return oracle_action_chunk')
+                                executed_action = np.asarray(oracle_action_chunk, dtype=np.float32)
+                                if executed_action.ndim != 3:
+                                    raise RuntimeError(
+                                        f'oracle_action_chunk should have shape [C, F, H], got {executed_action.shape}'
+                                    )
+                                oracle_override = True
+                                _write_speculative_log(
+                                    f"[SpeculativeVerifier] oracle override episode={now_seed} infer={infer_idx} "
+                                    f"segment={i} score={score:.6f} oracle_chunk={executed_action.shape[1]} "
+                                    f"no_replan=True"
+                                )
+
+                        first_action_denoise_verify = (
+                            action_denoise_first_verify_enabled
+                            and not current_draft_full_denoise_replan
+                            and i == start_idx
+                            and executed_steps_this_draft == 0
+                        )
+                        if first_action_denoise_verify:
+                            if i < pred_latents.shape[2]:
+                                verify_ret = model.infer(dict(
+                                    speculative_verify=True,
+                                    obs=current_real_obs,
+                                    pred_latent=pred_latents[:, :, i:i + 1],
+                                    draft_action=segment_action,
+                                    segment_index=int(i),
+                                    verify_frame_offset=int(i),
+                                ))
+                                score = float(verify_ret.get('speculative_verify_score', 0.0))
+                                passed = bool(verify_ret.get('speculative_verify_passed', False))
+                                _write_speculative_log(
+                                    f"[SpeculativeVerifier] episode={now_seed} infer={infer_idx} "
+                                    f"preexecute_action_denoise_segment={i} score={score:.6f} passed={passed}"
+                                )
+                                if not passed:
+                                    speculative_replan_full_denoise = True
+                                    if executed_steps_this_draft == 0:
+                                        first = was_first
+                                    _write_speculative_log(
+                                        f"[SpeculativeVerifier] pre-execution action_denoise reject episode={now_seed} "
+                                        f"infer={infer_idx} segment={i} score={score:.6f}; "
+                                        f"next_replan_full_denoise=True restore_first={first}"
+                                    )
+                                    break
+                            else:
+                                _write_speculative_log(
+                                    f"[SpeculativeVerifier] episode={now_seed} infer={infer_idx} "
+                                    f"preexecute_action_denoise_segment={i} skip_no_pred_latent=True"
+                                )
+
                         segment_obs_list = []
                         # Match the original RoboTwin feedback path: one model action frame
                         # is represented by 4 real observations for VAE temporal encoding.
-                        obs_sample_stride = max(1, action.shape[2] // 4)
-                        for j in range(action.shape[2]):
-                            raw_action_step = action[:, i, j].flatten()
-                            full_action_history.append(raw_action_step)
+                        obs_sample_stride = max(1, executed_action.shape[2] // 4)
+                        executed_frame_count = 0
+                        for frame_i in range(executed_action.shape[1]):
+                            for j in range(executed_action.shape[2]):
+                                raw_action_step = executed_action[:, frame_i, j].flatten()
+                                full_action_history.append(raw_action_step)
 
-                            ee_action = action[:, i, j]
-                            if action.shape[0] == 14:
-                                ee_action = np.concatenate([
-                                    ee_action[:3],
-                                    euler2quat(ee_action[3], ee_action[4], ee_action[5]),
-                                    ee_action[6:10],
-                                    euler2quat(ee_action[10], ee_action[11], ee_action[12]),
-                                    ee_action[13:14]
-                                ])
-                            elif action.shape[0] == 16:
-                                ee_action = add_init_pose(ee_action, inint_eef_pose)
-                                ee_action = np.concatenate([
-                                    ee_action[:3],
-                                    ee_action[3:7] / np.linalg.norm(ee_action[3:7]),
-                                    ee_action[7:11],
-                                    ee_action[11:15] / np.linalg.norm(ee_action[11:15]),
-                                    ee_action[15:16]
-                                ])
-                            else:
-                                raise NotImplementedError
-                            TASK_ENV.take_action(ee_action, action_type='ee')
+                                ee_action = executed_action[:, frame_i, j]
+                                if executed_action.shape[0] == 14:
+                                    ee_action = np.concatenate([
+                                        ee_action[:3],
+                                        euler2quat(ee_action[3], ee_action[4], ee_action[5]),
+                                        ee_action[6:10],
+                                        euler2quat(ee_action[10], ee_action[11], ee_action[12]),
+                                        ee_action[13:14]
+                                    ])
+                                elif executed_action.shape[0] == 16:
+                                    ee_action = add_init_pose(ee_action, inint_eef_pose)
+                                    ee_action = np.concatenate([
+                                        ee_action[:3],
+                                        ee_action[3:7] / np.linalg.norm(ee_action[3:7]),
+                                        ee_action[7:11],
+                                        ee_action[11:15] / np.linalg.norm(ee_action[11:15]),
+                                        ee_action[15:16]
+                                    ])
+                                else:
+                                    raise NotImplementedError
+                                TASK_ENV.take_action(ee_action, action_type='ee')
 
-                            if (j + 1) % obs_sample_stride == 0:
-                                obs = format_obs(TASK_ENV.get_obs(), prompt)
-                                full_obs_list.append(obs)
-                                segment_obs_list.append(obs)
+                                if (j + 1) % obs_sample_stride == 0:
+                                    obs = format_obs(TASK_ENV.get_obs(), prompt)
+                                    full_obs_list.append(obs)
+                                    segment_obs_list.append(obs)
+
+                            executed_frame_count = frame_i + 1
+                            if TASK_ENV.eval_success:
+                                break
+
+                        if executed_frame_count < executed_action.shape[1]:
+                            executed_action = executed_action[:, :executed_frame_count, :]
 
                         if not segment_obs_list:
                             real_obs = format_obs(TASK_ENV.get_obs(), prompt)
@@ -772,40 +870,43 @@ def eval_policy(task_name,
                             segment_obs_list.append(real_obs)
                         real_obs = segment_obs_list[-1]
                         current_real_obs = real_obs
-                        executed_steps_this_draft += action.shape[2]
+                        executed_steps_this_draft += executed_action.shape[1] * executed_action.shape[2]
 
-                        next_frame_idx = i + 1
-                        if next_frame_idx < action.shape[1] and next_frame_idx < pred_latents.shape[2]:
-                            verify_ret = model.infer(dict(
-                                speculative_verify=True,
-                                obs=segment_obs_list,
-                                pred_latent=pred_latents[:, :, next_frame_idx:next_frame_idx + 1],
-                                draft_action=action[:, next_frame_idx:next_frame_idx + 1, :],
-                                segment_index=int(next_frame_idx),
-                                verify_frame_offset=int(next_frame_idx),
-                            ))
-                            score = float(verify_ret.get('speculative_verify_score', 0.0))
-                            passed = bool(verify_ret.get('speculative_verify_passed', False))
-                            _write_speculative_log(
-                                f"[SpeculativeVerifier] episode={now_seed} infer={infer_idx} "
-                                f"executed_segment={i} verify_segment={next_frame_idx} "
-                                f"executed_steps={executed_steps_this_draft} score={score:.6f} passed={passed}"
-                            )
-                        else:
-                            score = float('nan')
-                            passed = True
-                            _write_speculative_log(
-                                f"[SpeculativeVerifier] episode={now_seed} infer={infer_idx} "
-                                f"executed_segment={i} skip_verify_no_next_draft_frame=True "
-                                f"executed_steps={executed_steps_this_draft}"
-                            )
+                        next_frame_idx = i + executed_action.shape[1]
+                        score = float('nan')
+                        passed = True
+                        skip_post_verify_for_replan_action = execute_full_replan_chunk
+                        if not oracle_preverify_enabled and not skip_post_verify_for_replan_action:
+                            if next_frame_idx < action.shape[1] and next_frame_idx < pred_latents.shape[2]:
+                                verify_ret = model.infer(dict(
+                                    speculative_verify=True,
+                                    obs=segment_obs_list,
+                                    pred_latent=pred_latents[:, :, next_frame_idx:next_frame_idx + 1],
+                                    draft_action=action[:, next_frame_idx:next_frame_idx + 1, :],
+                                    executed_action=executed_action,
+                                    segment_index=int(next_frame_idx),
+                                    verify_frame_offset=int(next_frame_idx),
+                                ))
+                                score = float(verify_ret.get('speculative_verify_score', 0.0))
+                                passed = bool(verify_ret.get('speculative_verify_passed', False))
+                                _write_speculative_log(
+                                    f"[SpeculativeVerifier] episode={now_seed} infer={infer_idx} "
+                                    f"executed_segment={i} verify_segment={next_frame_idx} "
+                                    f"executed_steps={executed_steps_this_draft} score={score:.6f} passed={passed}"
+                                )
+                            else:
+                                _write_speculative_log(
+                                    f"[SpeculativeVerifier] episode={now_seed} infer={infer_idx} "
+                                    f"executed_segment={i} skip_verify_no_next_draft_frame=True "
+                                    f"executed_steps={executed_steps_this_draft}"
+                                )
 
                         ret = model.infer(dict(
                             obs=segment_obs_list,
                             compute_kv_cache=True,
                             imagine=False,
                             save_visualization=save_visualization,
-                            state=segment_action,
+                            state=executed_action,
                         ))
                         if print_profile:
                             _print_profile(ret, now_seed, infer_idx)
@@ -814,6 +915,19 @@ def eval_policy(task_name,
                         if TASK_ENV.eval_success:
                             succ = True
                             break
+                        if skip_post_verify_for_replan_action:
+                            _write_speculative_log(
+                                f"[SpeculativeVerifier] action_denoise replan action committed episode={now_seed} "
+                                f"infer={infer_idx} segment={i} executed_action_frames={executed_action.shape[1]}; "
+                                f"skip_verify=True start_new_draft=True"
+                            )
+                            break
+                        if oracle_override:
+                            _write_speculative_log(
+                                f"[SpeculativeVerifier] oracle override committed episode={now_seed} infer={infer_idx} "
+                                f"segment={i}; start_new_draft=True"
+                            )
+                            break
                         if not passed:
                             speculative_replan_full_denoise = True
                             _write_speculative_log(
@@ -821,6 +935,7 @@ def eval_policy(task_name,
                                 f"segment={i} score={score:.6f}; next_replan_full_denoise=True"
                             )
                             break
+                        i += executed_action.shape[1]
 
                     if executed_steps_this_draft > 0:
                         speculative_executed_chunk_steps.append(executed_steps_this_draft)
@@ -973,11 +1088,12 @@ def eval_policy(task_name,
 
         if speculative_enabled and speculative_executed_chunk_steps:
             avg_chunk_steps = float(np.mean(speculative_executed_chunk_steps))
-            _write_speculative_log(
-                f"[SpeculativeVerifierSummary] episode={now_seed} chunks={len(speculative_executed_chunk_steps)} "
+            summary_msg = (
+                f"[SpeculativeVerifierSummary] episode={now_seed} "
                 f"avg_executed_action_steps={avg_chunk_steps:.2f} "
-                f"values={speculative_executed_chunk_steps}"
             )
+            _write_speculative_log(summary_msg)
+            print(summary_msg)
 
         if succ:
             TASK_ENV.suc += 1
