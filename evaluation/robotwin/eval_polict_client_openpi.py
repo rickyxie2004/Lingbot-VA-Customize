@@ -643,6 +643,10 @@ def eval_policy(task_name,
             speculative_enabled
             and speculative_verifier_mode == 'oracle_chunk1_action'
         )
+        oracle_parallel_draft_enabled = (
+            oracle_preverify_enabled
+            and getattr(va_robotwin_cfg, 'enable_speculative_oracle_parallel_draft', False)
+        )
         action_denoise_first_verify_enabled = (
             speculative_enabled
             and speculative_verifier_mode == 'action_denoise'
@@ -712,12 +716,19 @@ def eval_policy(task_name,
                             f"video_steps={current_ret.get('speculative_video_num_inference_steps_used', 'NA')} "
                             f"action_steps={current_ret.get('speculative_action_num_inference_steps_used', 'NA')} "
                             f"future_chunk={current_ret.get('speculative_replan_frame_chunk_size_used', 'NA')} "
-                            f"draft_chunk={current_ret.get('speculative_draft_frame_chunk_size', 'NA')}"
+                            f"draft_chunk={current_ret.get('speculative_draft_frame_chunk_size', 'NA')} "
+                            f"draft_batch={current_ret.get('speculative_draft_batch_size', 1)}"
                         )
                     speculative_replan_full_denoise = False
                     if print_profile:
                         _print_profile(current_ret, now_seed, infer_idx)
                 action = current_ret['action']
+                draft_candidate_actions = current_ret.get('speculative_draft_actions', None)
+                if draft_candidate_actions is not None:
+                    draft_candidate_actions = np.asarray(draft_candidate_actions, dtype=np.float32)
+                draft_parent_indices = current_ret.get('speculative_draft_parent_indices', None)
+                if draft_parent_indices is not None:
+                    draft_parent_indices = np.asarray(draft_parent_indices, dtype=np.int64)
                 if 'video' in current_ret:
                     imagined_video = current_ret['video']
                     gen_video_list.append(imagined_video)
@@ -739,34 +750,92 @@ def eval_policy(task_name,
                     first = False
                     start_idx = 1 if was_first else 0
                     executed_steps_this_draft = 0
+                    locked_draft_candidate_index = None
                     current_ret = None
 
                     i = start_idx
                     while i < action.shape[1]:
                         segment_action = action[:, i:i + 1, :]
                         execute_full_replan_chunk = (
-                            action_denoise_first_verify_enabled
+                            (action_denoise_first_verify_enabled or oracle_parallel_draft_enabled)
                             and current_draft_full_denoise_replan
                         )
                         executed_action = action[:, i:, :] if execute_full_replan_chunk else segment_action
                         oracle_override = False
-                        if oracle_preverify_enabled:
-                            verify_ret = model.infer(dict(
+                        if oracle_preverify_enabled and not execute_full_replan_chunk:
+                            draft_action_for_verify = segment_action
+                            draft_candidate_indices_for_verify = None
+                            if (oracle_parallel_draft_enabled and draft_candidate_actions is not None
+                                    and draft_candidate_actions.ndim == 4
+                                    and i < draft_candidate_actions.shape[2]):
+                                if locked_draft_candidate_index is None:
+                                    draft_candidate_indices_for_verify = np.arange(
+                                        draft_candidate_actions.shape[0], dtype=np.int64)
+                                else:
+                                    draft_candidate_indices_for_verify = np.asarray(
+                                        [locked_draft_candidate_index], dtype=np.int64)
+                                draft_action_for_verify = draft_candidate_actions[
+                                    draft_candidate_indices_for_verify, :, i:i + 1, :]
+                            verify_payload = dict(
                                 speculative_verify=True,
                                 oracle_preverify=True,
                                 obs=current_real_obs,
-                                draft_action=segment_action,
+                                draft_action=draft_action_for_verify,
                                 segment_index=int(i),
                                 verify_frame_offset=int(i),
-                            ))
+                            )
+                            if draft_candidate_indices_for_verify is not None:
+                                verify_payload['draft_candidate_indices'] = (
+                                    draft_candidate_indices_for_verify.tolist())
+                                if draft_parent_indices is not None:
+                                    verify_payload['draft_candidate_parent_indices'] = (
+                                        draft_parent_indices[
+                                            draft_candidate_indices_for_verify].tolist())
+                            verify_ret = model.infer(verify_payload)
                             score = float(verify_ret.get('speculative_verify_score', 0.0))
                             passed = bool(verify_ret.get('speculative_verify_passed', False))
+                            selected_candidate_index = int(verify_ret.get('selected_candidate_index', 0))
+                            candidate_scores = verify_ret.get('candidate_scores', None)
+                            selected_parent_index = int(verify_ret.get(
+                                'selected_parent_index',
+                                int(draft_parent_indices[selected_candidate_index])
+                                if draft_parent_indices is not None
+                                and 0 <= selected_candidate_index < len(draft_parent_indices)
+                                else -1,
+                            ))
                             _write_speculative_log(
                                 f"[SpeculativeVerifier] episode={now_seed} infer={infer_idx} "
                                 f"preverify_segment={i} executed_steps={executed_steps_this_draft} "
-                                f"score={score:.6f} passed={passed}"
+                                f"score={score:.6f} passed={passed} selected_candidate={selected_candidate_index} "
+                                f"selected_parent={selected_parent_index} "
+                                f"locked_candidate={locked_draft_candidate_index} "
+                                f"candidate_scores={candidate_scores}"
                             )
-                            if not passed:
+                            if oracle_parallel_draft_enabled:
+                                selected_chunk = verify_ret.get('selected_draft_action_chunk', None)
+                                if selected_chunk is None:
+                                    raise RuntimeError('oracle parallel verifier did not return selected_draft_action_chunk')
+                                selected_chunk = np.asarray(selected_chunk, dtype=np.float32)
+                                if selected_chunk.ndim != 3:
+                                    raise RuntimeError(
+                                        f'selected_draft_action_chunk should have shape [C, F, H], got {selected_chunk.shape}'
+                                    )
+                                if passed:
+                                    if locked_draft_candidate_index is None:
+                                        locked_draft_candidate_index = selected_candidate_index
+                                    segment_action = selected_chunk
+                                    executed_action = selected_chunk
+                                else:
+                                    speculative_replan_full_denoise = True
+                                    if executed_steps_this_draft == 0:
+                                        first = was_first
+                                    _write_speculative_log(
+                                        f"[SpeculativeVerifier] oracle parallel reject episode={now_seed} "
+                                        f"infer={infer_idx} segment={i} best_score={score:.6f}; "
+                                        f"next_replan_full_denoise=True restore_first={first}"
+                                    )
+                                    break
+                            elif not passed:
                                 oracle_action_chunk = verify_ret.get('oracle_action_chunk', None)
                                 if oracle_action_chunk is None:
                                     raise RuntimeError('oracle_chunk1_action verifier failed but did not return oracle_action_chunk')
@@ -917,7 +986,7 @@ def eval_policy(task_name,
                             break
                         if skip_post_verify_for_replan_action:
                             _write_speculative_log(
-                                f"[SpeculativeVerifier] action_denoise replan action committed episode={now_seed} "
+                                f"[SpeculativeVerifier] replan action committed episode={now_seed} "
                                 f"infer={infer_idx} segment={i} executed_action_frames={executed_action.shape[1]}; "
                                 f"skip_verify=True start_new_draft=True"
                             )

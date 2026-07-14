@@ -1,5 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import argparse
+import json
 import os
 import sys
 import time
@@ -450,6 +451,30 @@ class VA_Server:
                 else:
                     cache['v'] = cache['v'][:1].clone().repeat(cache_batch_size, 1, 1, 1)
 
+    def _repeat_transformer_cache_rows(self, source_batch_size, repeats):
+        if repeats <= 1:
+            return
+        for block in self.transformer.blocks:
+            attn_caches = block.attn1.attn_caches
+            if attn_caches is None or attn_caches.get(self.cache_name) is None:
+                continue
+            cache = attn_caches[self.cache_name]
+            for key in ('k', 'v'):
+                value = cache.get(key)
+                if value is None:
+                    continue
+                expected_batch = source_batch_size * (2 if self.use_cfg else 1)
+                if value.shape[0] != expected_batch:
+                    raise RuntimeError(
+                        f'Cannot expand {key} cache from batch {value.shape[0]}; '
+                        f'expected {expected_batch} for {source_batch_size} video parents')
+                if self.use_cfg:
+                    positive = value[:source_batch_size].repeat_interleave(repeats, dim=0)
+                    negative = value[source_batch_size:].repeat_interleave(repeats, dim=0)
+                    cache[key] = torch.cat([positive, negative], dim=0)
+                else:
+                    cache[key] = value.repeat_interleave(repeats, dim=0)
+
     def _repeat_input_for_cfg(self, input_dict):
         batch_size = input_dict['noisy_latents'].shape[0]
         if self.use_cfg:
@@ -687,9 +712,15 @@ class VA_Server:
         save_outputs=True,
         decode_video=True,
         reuse_init_latent=False,
+        batch_size=1,
+        action_children_per_video=1,
     ):
         profiler = self._new_latency_profiler()
         frame_chunk_size = int(frame_chunk_size or self.job_config.frame_chunk_size)
+        batch_size = int(batch_size)
+        batch_size = max(1, batch_size)
+        action_children_per_video = max(1, int(action_children_per_video))
+        action_batch_size = batch_size * action_children_per_video
         if frame_st_id == 0:
             if reuse_init_latent and self.init_latent is not None:
                 init_latent = self.init_latent
@@ -701,14 +732,14 @@ class VA_Server:
                 self.latest_real_latent = init_latent[:, :, -1:].detach().clone()
 
         with profiler.record('noise.init'):
-            latents = torch.randn(1,
+            latents = torch.randn(batch_size,
                                   48,
                                   frame_chunk_size,
                                   self.latent_height,
                                   self.latent_width,
                                   device=self.device,
                                   dtype=self.dtype)
-            actions = torch.randn(1,
+            actions = torch.randn(action_batch_size,
                                   self.job_config.action_dim,
                                   frame_chunk_size,
                                   self.action_per_frame,
@@ -754,7 +785,7 @@ class VA_Server:
                     step_suffix = f'.step_{i:02d}' if profiler.profile_steps else ''
                     last_step = i == len(timesteps) - 1
                     latent_cond = init_latent[:, :, 0:1].to(
-                        self.dtype) if frame_st_id == 0 else None
+                        self.dtype).repeat(batch_size, 1, 1, 1, 1) if frame_st_id == 0 else None
                     with profiler.record(f'video.prepare_input{step_suffix}'):
                         input_dict = self._prepare_latent_input(
                             latents,
@@ -777,11 +808,11 @@ class VA_Server:
                             video_noise_pred = data_seq_to_patch(
                                 self.job_config.patch_size, video_noise_pred,
                                 frame_chunk_size, self.latent_height,
-                                self.latent_width, batch_size=2 if self.use_cfg else 1)
+                                self.latent_width, batch_size=batch_size * (2 if self.use_cfg else 1))
                             if self.job_config.guidance_scale > 1:
-                                video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (video_noise_pred[:1] - video_noise_pred[1:])
+                                video_noise_pred = video_noise_pred[batch_size:] + self.job_config.guidance_scale * (video_noise_pred[:batch_size] - video_noise_pred[batch_size:])
                             else:
-                                video_noise_pred = video_noise_pred[:1]
+                                video_noise_pred = video_noise_pred[:batch_size]
                             latents = self.scheduler.step(video_noise_pred,
                                                           t,
                                                           latents,
@@ -789,13 +820,20 @@ class VA_Server:
 
                     latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
 
+            # Release the final video forward output before materializing action-child KV rows.
+            del video_noise_pred, input_dict
+            torch.cuda.empty_cache()
+
+            # Each action child reads its predicted-video parent's KV row.
+            self._repeat_transformer_cache_rows(batch_size, action_children_per_video)
+
             with profiler.record('action.loop'):
                 for i, t in enumerate(tqdm(action_timesteps)):
                     step_suffix = f'.step_{i:02d}' if profiler.profile_steps else ''
                     last_step = i == len(action_timesteps) - 1
                     action_cond = torch.zeros(
                         [
-                            1, self.job_config.action_dim, 1,
+                            action_batch_size, self.job_config.action_dim, 1,
                             self.action_per_frame, 1
                         ],
                         device=self.device,
@@ -823,9 +861,9 @@ class VA_Server:
                                                           'b (f n) c -> b c f n 1',
                                                           f=frame_chunk_size)
                             if self.job_config.action_guidance_scale > 1:
-                                action_noise_pred = action_noise_pred[1:] + self.job_config.action_guidance_scale * (action_noise_pred[:1] - action_noise_pred[1:])
+                                action_noise_pred = action_noise_pred[action_batch_size:] + self.job_config.action_guidance_scale * (action_noise_pred[:action_batch_size] - action_noise_pred[action_batch_size:])
                             else:
-                                action_noise_pred = action_noise_pred[:1]
+                                action_noise_pred = action_noise_pred[:action_batch_size]
                             actions = self.action_scheduler.step(action_noise_pred,
                                                                  t,
                                                                  actions,
@@ -841,7 +879,7 @@ class VA_Server:
             save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
 
         with profiler.record('action.postprocess'):
-            actions = self.postprocess_action(actions)
+            actions = self.postprocess_action(actions) if action_batch_size == 1 else self._postprocess_action_batch(actions)
         pred_video = None
         if decode_video:
             with profiler.record('video.decode'):
@@ -1105,24 +1143,55 @@ class VA_Server:
             action_steps = int(getattr(
                 self.job_config, 'speculative_action_num_inference_steps', self.job_config.action_num_inference_steps))
         frame_chunk_size = future_frame_chunk_size + 1 if self.frame_st_id == 0 else future_frame_chunk_size
+        oracle_parallel_draft = (
+            getattr(self.job_config, 'speculative_verifier_mode', '') == 'oracle_chunk1_action'
+            and bool(getattr(self.job_config, 'enable_speculative_oracle_parallel_draft', False))
+            and not full_denoise_replan
+        )
+        draft_batch_size = int(getattr(
+            self.job_config, 'speculative_oracle_parallel_draft_batch_size', 1)) if oracle_parallel_draft else 1
+        draft_batch_size = max(1, draft_batch_size)
+        action_children_per_video = int(getattr(
+            self.job_config, 'speculative_oracle_parallel_action_children_per_video', 2
+        )) if oracle_parallel_draft else 1
+        action_children_per_video = max(1, action_children_per_video)
+        if draft_batch_size % action_children_per_video != 0:
+            raise ValueError(
+                'speculative_oracle_parallel_draft_batch_size must be divisible by '
+                'speculative_oracle_parallel_action_children_per_video')
+        video_parent_count = draft_batch_size // action_children_per_video
         logger.info(
             f"[SpeculativeDraft] frame_st_id={self.frame_st_id} full_denoise_replan={full_denoise_replan} "
             f"video_steps={video_steps} action_steps={action_steps} frame_chunk_size={frame_chunk_size} "
-            f"future_frame_chunk_size={future_frame_chunk_size} base_future_frame_chunk_size={base_future_frame_chunk_size}"
+            f"future_frame_chunk_size={future_frame_chunk_size} base_future_frame_chunk_size={base_future_frame_chunk_size} "
+            f"oracle_parallel_draft={oracle_parallel_draft} video_parents={video_parent_count} "
+            f"action_children_per_video={action_children_per_video} draft_batch_size={draft_batch_size}"
         )
-        action, latents, profile, pred_video = self._infer(
-            obs,
-            frame_st_id=self.frame_st_id,
-            video_num_inference_steps=video_steps,
-            action_num_inference_steps=action_steps,
-            frame_chunk_size=frame_chunk_size,
-            reuse_init_latent=(self.frame_st_id == 0 and self.init_latent is not None),
-        )
-        # Do not let speculative future tokens become committed history.
-        self.transformer.clear_pred_cache(self.cache_name)
+        cache_snapshot = self._clone_transformer_cache() if draft_batch_size > 1 else None
+        try:
+            if video_parent_count > 1:
+                self._expand_transformer_cache_batch(video_parent_count)
+            action, latents, profile, pred_video = self._infer(
+                obs,
+                frame_st_id=self.frame_st_id,
+                video_num_inference_steps=video_steps,
+                action_num_inference_steps=action_steps,
+                frame_chunk_size=frame_chunk_size,
+                reuse_init_latent=(self.frame_st_id == 0 and self.init_latent is not None),
+                batch_size=video_parent_count,
+                action_children_per_video=action_children_per_video,
+            )
+        finally:
+            if cache_snapshot is not None:
+                self._restore_transformer_cache(cache_snapshot)
+            else:
+                # Do not let speculative future tokens become committed history.
+                self.transformer.clear_pred_cache(self.cache_name)
+        action_for_execution = action[0] if draft_batch_size > 1 else action
+        latents_for_result = latents[:1] if video_parent_count > 1 else latents
         result = {
-            'action': action,
-            'speculative_pred_latents': latents.detach().float().cpu().numpy(),
+            'action': action_for_execution,
+            'speculative_pred_latents': latents_for_result.detach().float().cpu().numpy(),
             'speculative_frame_chunk_size': int(base_future_frame_chunk_size),
             'speculative_replan_frame_chunk_size_used': int(future_frame_chunk_size),
             'speculative_draft_frame_chunk_size': int(frame_chunk_size),
@@ -1131,7 +1200,15 @@ class VA_Server:
             'speculative_full_denoise_replan': bool(full_denoise_replan),
             'speculative_video_num_inference_steps_used': int(video_steps),
             'speculative_action_num_inference_steps_used': int(action_steps),
+            'speculative_oracle_parallel_draft': bool(oracle_parallel_draft),
+            'speculative_draft_batch_size': int(draft_batch_size),
+            'speculative_video_parent_count': int(video_parent_count),
+            'speculative_action_children_per_video': int(action_children_per_video),
         }
+        if draft_batch_size > 1:
+            result['speculative_draft_actions'] = action.astype(np.float32)
+            result['speculative_draft_parent_indices'] = np.repeat(
+                np.arange(video_parent_count, dtype=np.int32), action_children_per_video)
         if pred_video is not None:
             result['video'] = pred_video
         if profile:
@@ -1160,6 +1237,337 @@ class VA_Server:
         if pred_latent.shape[2] != 1:
             pred_latent = pred_latent[:, :, -1:]
         return pred_latent.to(ref_latent)
+
+    def _action_channel_semantics(self, channel_id):
+        names = {
+            0: ('left_position', 'left_x'),
+            1: ('left_position', 'left_y'),
+            2: ('left_position', 'left_z'),
+            3: ('left_rotation', 'left_rot_0'),
+            4: ('left_rotation', 'left_rot_1'),
+            5: ('left_rotation', 'left_rot_2'),
+            6: ('left_rotation', 'left_rot_3'),
+            7: ('right_position', 'right_x'),
+            8: ('right_position', 'right_y'),
+            9: ('right_position', 'right_z'),
+            10: ('right_rotation', 'right_rot_0'),
+            11: ('right_rotation', 'right_rot_1'),
+            12: ('right_rotation', 'right_rot_2'),
+            13: ('right_rotation', 'right_rot_3'),
+            28: ('left_gripper', 'left_gripper'),
+            29: ('right_gripper', 'right_gripper'),
+        }
+        return names.get(int(channel_id), ('other', f'action_{int(channel_id)}'))
+
+    def _compute_action_denoise_group_metrics(self, pred_velocity, actual_velocity):
+        diff = (pred_velocity.float() - actual_velocity.float()).detach()
+        actual_velocity = actual_velocity.float().detach()
+        pred_velocity = pred_velocity.float().detach()
+        reduce_dims = (0, 2, 3, 4)
+        mse_by_dim = diff.square().mean(dim=reduce_dims).cpu().numpy()
+        rmse_by_dim = np.sqrt(mse_by_dim)
+        abs_mean_by_dim = diff.abs().mean(dim=reduce_dims).cpu().numpy()
+        abs_max_by_dim = diff.abs().amax(dim=reduce_dims).cpu().numpy()
+        signed_mean_by_dim = diff.mean(dim=reduce_dims).cpu().numpy()
+        actual_rms_by_dim = torch.sqrt(actual_velocity.square().mean(dim=reduce_dims)).cpu().numpy()
+        pred_rms_by_dim = torch.sqrt(pred_velocity.square().mean(dim=reduce_dims)).cpu().numpy()
+
+        used_ids = list(getattr(self.job_config, 'used_action_channel_ids', []))
+        if not used_ids:
+            used_ids = torch.where(self.action_mask.detach().cpu())[0].tolist()
+        dim_records = []
+        group_sums = {}
+        for rank, channel_id in enumerate(used_ids):
+            channel_id = int(channel_id)
+            group, name = self._action_channel_semantics(channel_id)
+            rel_rmse = float(rmse_by_dim[channel_id] / (actual_rms_by_dim[channel_id] + 1e-8))
+            record = {
+                'used_rank': int(rank),
+                'channel_id': channel_id,
+                'group': group,
+                'name': name,
+                'mse': float(mse_by_dim[channel_id]),
+                'rmse': float(rmse_by_dim[channel_id]),
+                'abs_mean': float(abs_mean_by_dim[channel_id]),
+                'abs_max': float(abs_max_by_dim[channel_id]),
+                'signed_mean': float(signed_mean_by_dim[channel_id]),
+                'actual_rms': float(actual_rms_by_dim[channel_id]),
+                'pred_rms': float(pred_rms_by_dim[channel_id]),
+                'rel_rmse': rel_rmse,
+            }
+            dim_records.append(record)
+            group_sums.setdefault(group, []).append(record)
+
+        group_records = {}
+        for group, records in group_sums.items():
+            group_records[group] = {
+                'mse_mean': float(np.mean([r['mse'] for r in records])),
+                'rmse_mean': float(np.mean([r['rmse'] for r in records])),
+                'abs_mean': float(np.mean([r['abs_mean'] for r in records])),
+                'rel_rmse_mean': float(np.mean([r['rel_rmse'] for r in records])),
+                'num_dims': int(len(records)),
+            }
+        return dim_records, group_records
+
+    def _compute_action_denoise_semantic_score(self, pred_velocity, actual_velocity):
+        _, group_records = self._compute_action_denoise_group_metrics(pred_velocity, actual_velocity)
+        position_score = max(
+            group_records.get('left_position', {}).get('mse_mean', 0.0),
+            group_records.get('right_position', {}).get('mse_mean', 0.0),
+        )
+        rotation_score = max(
+            group_records.get('left_rotation', {}).get('mse_mean', 0.0),
+            group_records.get('right_rotation', {}).get('mse_mean', 0.0),
+        )
+        gripper_score = max(
+            group_records.get('left_gripper', {}).get('mse_mean', 0.0),
+            group_records.get('right_gripper', {}).get('mse_mean', 0.0),
+        )
+        gripper_clip = float(getattr(self.job_config, 'action_denoise_gripper_clip', 2.0))
+        clipped_gripper_score = min(gripper_score, gripper_clip)
+        pos_th = float(getattr(self.job_config, 'action_denoise_position_threshold', 1.0))
+        rot_th = float(getattr(self.job_config, 'action_denoise_rotation_threshold', 0.25))
+        grip_th = float(getattr(self.job_config, 'action_denoise_gripper_threshold', 1.5))
+        pos_risk = position_score / max(pos_th, 1e-8)
+        rot_risk = rotation_score / max(rot_th, 1e-8)
+        grip_risk = clipped_gripper_score / max(grip_th, 1e-8)
+        max_risk_score = max(pos_risk, rot_risk, grip_risk)
+        weighted_threshold = float(getattr(
+            self.job_config, 'action_denoise_semantic_weighted_threshold', 1.0))
+        pos_hard = float(getattr(self.job_config, 'action_denoise_position_hard_risk', 2.0))
+        rot_hard = float(getattr(self.job_config, 'action_denoise_rotation_hard_risk', 4.0))
+        grip_hard = float(getattr(self.job_config, 'action_denoise_gripper_hard_risk', 2.0))
+        pos_w = float(getattr(self.job_config, 'action_denoise_semantic_position_weight', 0.65))
+        rot_w = float(getattr(self.job_config, 'action_denoise_semantic_rotation_weight', 0.20))
+        grip_w = float(getattr(self.job_config, 'action_denoise_semantic_gripper_weight', 0.15))
+        weighted_score = pos_w * position_score + rot_w * rotation_score + grip_w * clipped_gripper_score
+        hard_fail = bool(pos_risk > pos_hard or rot_risk > rot_hard or grip_risk > grip_hard)
+        passed = bool(weighted_score < weighted_threshold and not hard_fail)
+        details = {
+            'position_score': float(position_score),
+            'rotation_score': float(rotation_score),
+            'gripper_score': float(gripper_score),
+            'clipped_gripper_score': float(clipped_gripper_score),
+            'position_risk': float(pos_risk),
+            'rotation_risk': float(rot_risk),
+            'gripper_risk': float(grip_risk),
+            'weighted_score': float(weighted_score),
+            'thresholds': {
+                'position': float(pos_th),
+                'rotation': float(rot_th),
+                'gripper': float(grip_th),
+                'weighted': float(weighted_threshold),
+                'gripper_clip': float(gripper_clip),
+            },
+            'hard_risks': {
+                'position': float(pos_hard),
+                'rotation': float(rot_hard),
+                'gripper': float(grip_hard),
+            },
+            'weights': {
+                'position': float(pos_w),
+                'rotation': float(rot_w),
+                'gripper': float(grip_w),
+            },
+            'max_risk_score': float(max_risk_score),
+            'hard_fail': bool(hard_fail),
+            'group_metrics': group_records,
+        }
+        return float(weighted_score), bool(passed), float(weighted_threshold), details
+
+    def _compute_oracle_action_semantic_weighted_score(self, diff):
+        diff = np.asarray(diff, dtype=np.float32)
+        if diff.size == 0:
+            return 0.0, {
+                'weighted_score': 0.0,
+                'position_score': 0.0,
+                'rotation_score': 0.0,
+                'gripper_score': 0.0,
+                'other_score': 0.0,
+                'dim_metrics': [],
+            }
+
+        if diff.ndim == 0:
+            diff = diff.reshape(1)
+        # Oracle action chunks are [C, H] or [B, C, H], so the action channel
+        # axis is the second-last axis when a horizon axis is present.
+        channel_axis = -2 if diff.ndim >= 2 else 0
+        action_dim = int(diff.shape[channel_axis])
+        if action_dim == 0:
+            return 0.0, {
+                'weighted_score': 0.0,
+                'position_score': 0.0,
+                'rotation_score': 0.0,
+                'gripper_score': 0.0,
+                'other_score': 0.0,
+                'dim_metrics': [],
+            }
+
+        used_ids = list(getattr(self.job_config, 'used_action_channel_ids', []))
+        if used_ids and len(used_ids) == action_dim:
+            channel_ids = [int(v) for v in used_ids]
+        else:
+            channel_ids = list(range(action_dim))
+
+        grouped_values = {
+            'position': [],
+            'rotation': [],
+            'gripper': [],
+            'other': [],
+        }
+        dim_metrics = []
+        for rank, channel_id in enumerate(channel_ids):
+            group, name = self._action_channel_semantics(channel_id)
+            if group.endswith('_position'):
+                semantic_group = 'position'
+            elif group.endswith('_rotation'):
+                semantic_group = 'rotation'
+            elif group.endswith('_gripper'):
+                semantic_group = 'gripper'
+            else:
+                semantic_group = 'other'
+            values = np.take(diff, rank, axis=channel_axis).reshape(-1)
+            grouped_values[semantic_group].append(values)
+            dim_metrics.append({
+                'rank': int(rank),
+                'channel_id': int(channel_id),
+                'group': group,
+                'semantic_group': semantic_group,
+                'name': name,
+                'rmse': float(np.sqrt(np.mean(values ** 2))),
+                'abs_mean': float(np.mean(np.abs(values))),
+                'abs_max': float(np.max(np.abs(values))),
+            })
+
+        def _group_rmse(group_name):
+            values = grouped_values.get(group_name, [])
+            if not values:
+                return 0.0
+            values = np.concatenate(values, axis=0)
+            return float(np.sqrt(np.mean(values ** 2)))
+
+        position_score = _group_rmse('position')
+        rotation_score = _group_rmse('rotation')
+        gripper_score = _group_rmse('gripper')
+        other_score = _group_rmse('other')
+        pos_w = float(getattr(self.job_config, 'speculative_oracle_action_position_weight', 0.65))
+        rot_w = float(getattr(self.job_config, 'speculative_oracle_action_rotation_weight', 0.20))
+        grip_w = float(getattr(self.job_config, 'speculative_oracle_action_gripper_weight', 0.15))
+        other_w = float(getattr(self.job_config, 'speculative_oracle_action_other_weight', 0.0))
+        weighted_score = (
+            pos_w * position_score
+            + rot_w * rotation_score
+            + grip_w * gripper_score
+            + other_w * other_score
+        )
+        details = {
+            'weighted_score': float(weighted_score),
+            'position_score': float(position_score),
+            'rotation_score': float(rotation_score),
+            'gripper_score': float(gripper_score),
+            'other_score': float(other_score),
+            'weights': {
+                'position': float(pos_w),
+                'rotation': float(rot_w),
+                'gripper': float(grip_w),
+                'other': float(other_w),
+            },
+            'dim_metrics': dim_metrics,
+        }
+        return float(weighted_score), details
+
+    def _log_action_denoise_dim_analysis(
+        self,
+        pred_velocity,
+        actual_velocity,
+        segment_index,
+        verify_frame_st_id,
+        score,
+        threshold,
+        passed,
+        action_t,
+        sigma,
+        score_mode='mean_mse',
+        semantic_details=None,
+    ):
+        if not getattr(self.job_config, 'enable_action_denoise_dim_analysis', False):
+            return
+        diff = (pred_velocity.float() - actual_velocity.float()).detach()
+        actual_velocity = actual_velocity.float().detach()
+        pred_velocity = pred_velocity.float().detach()
+        reduce_dims = (0, 2, 3, 4)
+        mse_by_dim = diff.square().mean(dim=reduce_dims).cpu().numpy()
+        rmse_by_dim = np.sqrt(mse_by_dim)
+        abs_mean_by_dim = diff.abs().mean(dim=reduce_dims).cpu().numpy()
+        abs_max_by_dim = diff.abs().amax(dim=reduce_dims).cpu().numpy()
+        signed_mean_by_dim = diff.mean(dim=reduce_dims).cpu().numpy()
+        actual_rms_by_dim = torch.sqrt(actual_velocity.square().mean(dim=reduce_dims)).cpu().numpy()
+        pred_rms_by_dim = torch.sqrt(pred_velocity.square().mean(dim=reduce_dims)).cpu().numpy()
+
+        used_ids = list(getattr(self.job_config, 'used_action_channel_ids', []))
+        if not used_ids:
+            used_ids = torch.where(self.action_mask.detach().cpu())[0].tolist()
+        dim_records = []
+        group_sums = {}
+        for rank, channel_id in enumerate(used_ids):
+            channel_id = int(channel_id)
+            group, name = self._action_channel_semantics(channel_id)
+            rel_rmse = float(rmse_by_dim[channel_id] / (actual_rms_by_dim[channel_id] + 1e-8))
+            record = {
+                'used_rank': int(rank),
+                'channel_id': channel_id,
+                'group': group,
+                'name': name,
+                'mse': float(mse_by_dim[channel_id]),
+                'rmse': float(rmse_by_dim[channel_id]),
+                'abs_mean': float(abs_mean_by_dim[channel_id]),
+                'abs_max': float(abs_max_by_dim[channel_id]),
+                'signed_mean': float(signed_mean_by_dim[channel_id]),
+                'actual_rms': float(actual_rms_by_dim[channel_id]),
+                'pred_rms': float(pred_rms_by_dim[channel_id]),
+                'rel_rmse': rel_rmse,
+            }
+            dim_records.append(record)
+            group_sums.setdefault(group, []).append(record)
+
+        group_records = {}
+        for group, records in group_sums.items():
+            group_records[group] = {
+                'mse_mean': float(np.mean([r['mse'] for r in records])),
+                'rmse_mean': float(np.mean([r['rmse'] for r in records])),
+                'abs_mean': float(np.mean([r['abs_mean'] for r in records])),
+                'rel_rmse_mean': float(np.mean([r['rel_rmse'] for r in records])),
+                'num_dims': int(len(records)),
+            }
+
+        payload = {
+            'mode': 'action_denoise_dim_analysis',
+            'frame_st_id': int(self.frame_st_id),
+            'verify_frame_st_id': int(verify_frame_st_id),
+            'segment_index': int(segment_index),
+            'score': float(score),
+            'threshold': float(threshold),
+            'passed': bool(passed),
+            'score_mode': str(score_mode),
+            'semantic_details': semantic_details,
+            'action_t': float(action_t.detach().cpu()),
+            'sigma': float(sigma.detach().cpu()),
+            'target': 'actual_velocity',
+            'dim_metrics': dim_records,
+            'group_metrics': group_records,
+        }
+        log_path = getattr(self.job_config, 'action_denoise_dim_analysis_log_path', None)
+        if log_path is None:
+            log_path = getattr(self.job_config, 'speculative_verifier_log_path', None)
+        if log_path:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + '\n')
+        logger.info(
+            f"[ActionDenoiseDimAnalysis] frame_st_id={self.frame_st_id} "
+            f"verify_frame_st_id={verify_frame_st_id} segment={segment_index} "
+            f"score_mode={score_mode} score={score:.6f} groups={group_records}"
+        )
 
     def _verify_speculative(self, obs):
         mode = getattr(self.job_config, 'speculative_verifier_mode', 'action_denoise')
@@ -1221,7 +1629,32 @@ class VA_Server:
 
         draft_action = np.asarray(draft_action, dtype=np.float32)
         oracle_action = np.asarray(oracle_action, dtype=np.float32)
-        draft_chunk = draft_action[:, 0, :] if draft_action.ndim == 3 else draft_action
+        if draft_action.ndim == 4:
+            draft_chunks = draft_action[:, :, 0, :]
+        elif draft_action.ndim == 3:
+            draft_chunks = draft_action[:, 0, :][None]
+        elif draft_action.ndim == 2:
+            draft_chunks = draft_action[None]
+        else:
+            raise ValueError(f'Unsupported draft_action shape for oracle verifier: {draft_action.shape}')
+        candidate_indices_value = obs.get('draft_candidate_indices', None)
+        if candidate_indices_value is None:
+            candidate_indices_value = np.arange(draft_chunks.shape[0])
+        candidate_indices = np.asarray(candidate_indices_value, dtype=np.int64).reshape(-1)
+        candidate_parent_indices_value = obs.get('draft_candidate_parent_indices', None)
+        if candidate_parent_indices_value is None:
+            candidate_parent_indices_value = np.arange(draft_chunks.shape[0])
+        candidate_parent_indices = np.asarray(
+            candidate_parent_indices_value, dtype=np.int64).reshape(-1)
+        if candidate_indices.shape[0] != draft_chunks.shape[0]:
+            raise ValueError(
+                f'draft_candidate_indices has {candidate_indices.shape[0]} entries for '
+                f'{draft_chunks.shape[0]} draft candidates')
+        if candidate_parent_indices.shape[0] != draft_chunks.shape[0]:
+            raise ValueError(
+                f'draft_candidate_parent_indices has {candidate_parent_indices.shape[0]} entries for '
+                f'{draft_chunks.shape[0]} draft candidates')
+
         if oracle_action.ndim == 3:
             if oracle_compare_idx >= oracle_action.shape[1]:
                 oracle_compare_idx = 0
@@ -1232,24 +1665,73 @@ class VA_Server:
         else:
             oracle_chunk = oracle_action
             oracle_action_chunk = oracle_action[:, None, :]
-        common_shape = tuple(min(a, b) for a, b in zip(draft_chunk.shape, oracle_chunk.shape))
-        slices = tuple(slice(0, n) for n in common_shape)
-        draft_chunk = draft_chunk[slices]
-        oracle_chunk = oracle_chunk[slices]
-        diff = draft_chunk - oracle_chunk
-        score = float(np.sqrt(np.mean(diff ** 2)))
+
+        common_channels = min(draft_chunks.shape[1], oracle_chunk.shape[0])
+        common_horizon = min(draft_chunks.shape[2], oracle_chunk.shape[1])
+        draft_chunks = draft_chunks[:, :common_channels, :common_horizon]
+        oracle_chunk = oracle_chunk[:common_channels, :common_horizon]
+        diff_all = draft_chunks - oracle_chunk[None]
+        candidate_rmse_scores = np.sqrt(np.mean(diff_all ** 2, axis=(1, 2)))
+        score_mode = getattr(self.job_config, 'speculative_oracle_action_score_mode', 'rmse')
+        candidate_scores = []
+        candidate_semantic_details = []
+        if score_mode == 'semantic_weighted':
+            for candidate_diff in diff_all:
+                candidate_score, candidate_details = self._compute_oracle_action_semantic_weighted_score(candidate_diff)
+                candidate_scores.append(float(candidate_score))
+                candidate_semantic_details.append(candidate_details)
+        elif score_mode == 'rmse':
+            candidate_scores = [float(x) for x in candidate_rmse_scores]
+            candidate_semantic_details = [None] * len(candidate_scores)
+        else:
+            raise ValueError(
+                f'Unknown speculative_oracle_action_score_mode: {score_mode}. Use rmse or semantic_weighted')
+        parent_rank_scores = {}
+        for parent_idx in np.unique(candidate_parent_indices):
+            child_indices = np.flatnonzero(candidate_parent_indices == parent_idx)
+            child_scores = np.asarray(
+                [candidate_scores[idx] for idx in child_indices], dtype=np.float64)
+            best_child_score = float(np.min(child_scores))
+            parent_rank_scores[int(parent_idx)] = (
+                best_child_score + 0.25 * (float(np.mean(child_scores)) - best_child_score)
+            )
+        selected_parent_idx = min(parent_rank_scores, key=parent_rank_scores.get)
+        selected_parent_children = np.flatnonzero(
+            candidate_parent_indices == selected_parent_idx)
+        selected_candidate_local_idx = int(selected_parent_children[
+            np.argmin([candidate_scores[idx] for idx in selected_parent_children])])
+        selected_candidate_idx = int(candidate_indices[selected_candidate_local_idx])
+        diff = diff_all[selected_candidate_local_idx]
+        score = float(candidate_scores[selected_candidate_local_idx])
+        rmse_score = float(candidate_rmse_scores[selected_candidate_local_idx])
+        semantic_details = candidate_semantic_details[selected_candidate_local_idx]
+        selected_draft_chunk = draft_chunks[selected_candidate_local_idx]
+        selected_draft_action_chunk = selected_draft_chunk[:, None, :]
         passed = bool(score < threshold)
         ref_l2 = float(np.sqrt(np.mean(oracle_chunk ** 2)) + 1e-8)
-        rel_l2 = float(score / ref_l2)
+        rel_l2 = float(rmse_score / ref_l2)
         abs_mean = float(np.mean(np.abs(diff)))
         abs_max = float(np.max(np.abs(diff)))
 
+        semantic_msg = ''
+        if semantic_details is not None:
+            semantic_msg = (
+                f" oracle_position_score={semantic_details['position_score']:.6f}"
+                f" oracle_rotation_score={semantic_details['rotation_score']:.6f}"
+                f" oracle_gripper_score={semantic_details['gripper_score']:.6f}"
+                f" oracle_weighted_score={semantic_details['weighted_score']:.6f}"
+            )
         message = (
             f"[SpeculativeVerifier] mode=oracle_chunk1_action preverify={oracle_preverify} "
-            f"frame_st_id={self.frame_st_id} segment={segment_index} score_rmse={score:.6f} "
-            f"threshold={threshold:.6f} passed={passed} oracle_chunk={oracle_chunk_size} "
-            f"oracle_compare_idx={oracle_compare_idx} shape={list(common_shape)} "
+            f"frame_st_id={self.frame_st_id} segment={segment_index} score_mode={score_mode} "
+            f"score={score:.6f} score_rmse={rmse_score:.6f} threshold={threshold:.6f} "
+            f"passed={passed} oracle_chunk={oracle_chunk_size} selected_candidate={selected_candidate_idx} "
+            f"selected_parent={selected_parent_idx} parent_rank_scores={parent_rank_scores} "
+            f"num_candidates={len(candidate_scores)} candidate_scores={candidate_scores} "
+            f"candidate_rmse_scores={[float(x) for x in candidate_rmse_scores]} "
+            f"oracle_compare_idx={oracle_compare_idx} shape={[common_channels, common_horizon]} "
             f"abs_mean={abs_mean:.6f} abs_max={abs_max:.6f} rel_l2={rel_l2:.6f}"
+            f"{semantic_msg}"
         )
         logger.info(message)
         log_path = getattr(self.job_config, 'speculative_verifier_log_path', None)
@@ -1266,10 +1748,25 @@ class VA_Server:
             'oracle_preverify': bool(oracle_preverify),
             'oracle_compare_idx': int(oracle_compare_idx),
             'oracle_action_chunk': oracle_action_chunk.astype(np.float32),
+            'selected_draft_action_chunk': selected_draft_action_chunk.astype(np.float32),
+            'selected_candidate_index': int(selected_candidate_idx),
+            'selected_candidate_local_index': int(selected_candidate_local_idx),
+            'draft_candidate_indices': [int(x) for x in candidate_indices],
+            'draft_candidate_parent_indices': [int(x) for x in candidate_parent_indices],
+            'selected_parent_index': int(selected_parent_idx),
+            'parent_rank_scores': {
+                str(key): float(value) for key, value in parent_rank_scores.items()
+            },
+            'candidate_scores': [float(x) for x in candidate_scores],
+            'candidate_rmse_scores': [float(x) for x in candidate_rmse_scores],
+            'candidate_semantic_details': candidate_semantic_details,
             'oracle_action_chunk_size': int(oracle_action_chunk.shape[1]),
             'oracle_abs_mean': abs_mean,
             'oracle_abs_max': abs_max,
             'oracle_rel_l2': rel_l2,
+            'oracle_score_mode': str(score_mode),
+            'oracle_rmse_score': float(rmse_score),
+            'oracle_semantic_details': semantic_details,
         }
 
     def _verify_speculative_action_denoise(self, obs):
@@ -1333,20 +1830,57 @@ class VA_Server:
             pred_velocity[:, ~self.action_mask] *= 0
             actual_velocity[:, ~self.action_mask] *= 0
             verifier = ActionDenoiseSpeculativeVerifier(threshold)
-            score, passed = verifier.verify(pred_velocity, actual_velocity, self.action_mask)
+            mean_mse_score, mean_mse_passed = verifier.verify(
+                pred_velocity, actual_velocity, self.action_mask)
+            score_mode = getattr(self.job_config, 'action_denoise_score_mode', 'mean_mse')
+            semantic_details = None
+            if score_mode == 'semantic_weighted':
+                score, passed, threshold, semantic_details = self._compute_action_denoise_semantic_score(
+                    pred_velocity, actual_velocity)
+                semantic_details['mean_mse_score'] = float(mean_mse_score)
+                semantic_details['mean_mse_passed'] = bool(mean_mse_passed)
+            elif score_mode == 'mean_mse':
+                score, passed = mean_mse_score, mean_mse_passed
+            else:
+                raise ValueError(
+                    f'Unknown action_denoise_score_mode: {score_mode}. Use mean_mse or semantic_weighted')
         finally:
             self._restore_transformer_cache(cache_snapshot)
+
+        self._log_action_denoise_dim_analysis(
+            pred_velocity,
+            actual_velocity,
+            segment_index,
+            verify_frame_st_id,
+            score,
+            threshold,
+            passed,
+            action_t,
+            sigma,
+            score_mode=score_mode,
+            semantic_details=semantic_details,
+        )
 
         profile = profiler.summary('speculative_action_denoise_verify', frame_st_id=verify_frame_st_id)
         self._log_latency_profile(profile)
         message = (
             f"[SpeculativeVerifier] mode=action_denoise frame_st_id={self.frame_st_id} "
             f"verify_frame_st_id={verify_frame_st_id} segment={segment_index} "
-            f"score={score:.6f} threshold={threshold:.6f} "
+            f"score={score:.6f} threshold={threshold:.6f} score_mode={score_mode} "
             f"passed={passed} action_t={float(action_t.detach().cpu()):.6f} "
             f"sigma={float(sigma.detach().cpu()):.6f} target=actual_velocity "
             f"obs_frames={len(real_obs_list)} condition_frames={latent_condition.shape[2]}"
         )
+        if semantic_details is not None:
+            message += (
+                f" semantic_position_risk={semantic_details['position_risk']:.6f}"
+                f" semantic_rotation_risk={semantic_details['rotation_risk']:.6f}"
+                f" semantic_gripper_risk={semantic_details['gripper_risk']:.6f}"
+                f" semantic_weighted_score={semantic_details['weighted_score']:.6f}"
+                f" semantic_max_risk_score={semantic_details['max_risk_score']:.6f}"
+                f" semantic_hard_fail={semantic_details['hard_fail']}"
+                f" mean_mse_score={semantic_details['mean_mse_score']:.6f}"
+            )
         logger.info(message)
         log_path = getattr(self.job_config, 'speculative_verifier_log_path', None)
         if log_path:
@@ -1358,6 +1892,8 @@ class VA_Server:
             'speculative_verify_passed': bool(passed),
             'speculative_verify_threshold': float(threshold),
             'speculative_verifier_mode': 'action_denoise',
+            'action_denoise_score_mode': str(score_mode),
+            'action_denoise_semantic_details': semantic_details,
             'segment_index': int(segment_index),
         }
 

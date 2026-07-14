@@ -4,3 +4,4 @@ visualization/
 train_out/
 *.egg-info/
 *.txt
+action_*.jsonl
