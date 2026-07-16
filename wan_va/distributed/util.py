@@ -13,11 +13,13 @@ def _configure_model(model, shard_fn, param_dtype, device, eval_mode=True):
     # FSDP lazy init expects all original floating parameters in a shard group
     # to have one dtype. Some checkpoints keep small params in fp32 even when
     # loaded with torch_dtype, so normalize before fully_shard wraps modules.
-    model.to(device=device, dtype=param_dtype)
+    # model.to(device=device, dtype=param_dtype)
 
     if dist.is_initialized():
         dist.barrier()
         model = shard_fn(model, param_dtype=param_dtype)
+    else:
+        model.to(device=device, dtype=param_dtype)
 
     return model
 

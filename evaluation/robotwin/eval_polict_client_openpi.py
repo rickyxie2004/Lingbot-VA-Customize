@@ -866,6 +866,10 @@ def eval_policy(task_name,
                                     draft_action=segment_action,
                                     segment_index=int(i),
                                     verify_frame_offset=int(i),
+                                    analysis_episode_id=int(now_seed),
+                                    analysis_step_id=int(TASK_ENV.take_action_cnt),
+                                    analysis_task=str(task_name),
+                                    analysis_phase='preexecute',
                                 ))
                                 score = float(verify_ret.get('speculative_verify_score', 0.0))
                                 passed = bool(verify_ret.get('speculative_verify_passed', False))
@@ -955,6 +959,10 @@ def eval_policy(task_name,
                                     executed_action=executed_action,
                                     segment_index=int(next_frame_idx),
                                     verify_frame_offset=int(next_frame_idx),
+                                    analysis_episode_id=int(now_seed),
+                                    analysis_step_id=int(TASK_ENV.take_action_cnt),
+                                    analysis_task=str(task_name),
+                                    analysis_phase='postexecute',
                                 ))
                                 score = float(verify_ret.get('speculative_verify_score', 0.0))
                                 passed = bool(verify_ret.get('speculative_verify_passed', False))
@@ -1169,6 +1177,15 @@ def eval_policy(task_name,
             print("\033[92mSuccess!\033[0m")
         else:
             print("\033[91mFail!\033[0m")
+
+        if getattr(va_robotwin_cfg, 'enable_local_contraction_analysis', False):
+            model.infer(dict(
+                local_contraction_episode_end=True,
+                analysis_episode_id=int(now_seed),
+                analysis_step_id=int(TASK_ENV.take_action_cnt),
+                analysis_task=str(task_name),
+                episode_success=bool(succ),
+            ))
 
         now_id += 1
         TASK_ENV.close_env(clear_cache=((succ_seed + 1) % clear_cache_freq == 0))

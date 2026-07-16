@@ -528,16 +528,24 @@ class WanAttention(torch.nn.Module):
             key = apply_rotary_emb(key, rotary_emb)
         slots = None
         if kv_cache is not None and kv_cache['k'] is not None:
-            slots = self.update_cache(cache_name,
-                                      key,
-                                      value,
-                                      is_pred=(update_cache == 1))
             key_pool = self.attn_caches[cache_name]['k']
             value_pool = self.attn_caches[cache_name]['v']
             mask = self.attn_caches[cache_name]['mask']
             valid = mask.nonzero(as_tuple=False).squeeze(-1)
-            key = key_pool[:, valid]
-            value = value_pool[:, valid]
+            if update_cache == -1:
+                # Analysis-only read-only cache path: cached history is fixed,
+                # while gradients flow through the current action K/V.
+                key = torch.cat([key_pool[:, valid].detach(), key], dim=1)
+                value = torch.cat([value_pool[:, valid].detach(), value], dim=1)
+            else:
+                slots = self.update_cache(cache_name,
+                                          key,
+                                          value,
+                                          is_pred=(update_cache == 1))
+                mask = self.attn_caches[cache_name]['mask']
+                valid = mask.nonzero(as_tuple=False).squeeze(-1)
+                key = key_pool[:, valid]
+                value = value_pool[:, valid]
 
         hidden_states = self.attn_op(query, key, value)
 

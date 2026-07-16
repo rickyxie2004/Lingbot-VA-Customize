@@ -1769,6 +1769,335 @@ class VA_Server:
             'oracle_semantic_details': semantic_details,
         }
 
+    def _predict_action_velocity_for_contraction(
+        self,
+        noisy_action,
+        action_t,
+        verify_frame_st_id,
+    ):
+        action_mask = self.action_mask.to(noisy_action.device)
+        mask_shape = [1, action_mask.numel()] + [1] * (noisy_action.ndim - 2)
+        masked_action = noisy_action * action_mask.view(mask_shape).to(noisy_action.dtype)
+        input_dict = self._prepare_latent_input(
+            None,
+            masked_action,
+            action_t=action_t,
+            frame_st_id=verify_frame_st_id,
+        )
+        pred_velocity = self.transformer(
+            self._repeat_input_for_cfg(input_dict['action_res_lst']),
+            update_cache=-1,
+            cache_name=self.cache_name,
+            action_mode=True,
+        )
+        pred_velocity = rearrange(
+            pred_velocity,
+            'b (f n) c -> b c f n 1',
+            f=noisy_action.shape[2],
+        )
+        batch_size = noisy_action.shape[0]
+        if self.job_config.action_guidance_scale > 1:
+            pred_velocity = pred_velocity[batch_size:] + self.job_config.action_guidance_scale * (
+                pred_velocity[:batch_size] - pred_velocity[batch_size:])
+        else:
+            pred_velocity = pred_velocity[:batch_size]
+        return pred_velocity * action_mask.view(mask_shape).to(pred_velocity.dtype)
+
+    def _normalize_contraction_direction(self, direction):
+        action_mask = self.action_mask.to(direction.device)
+        mask_shape = [1, action_mask.numel()] + [1] * (direction.ndim - 2)
+        direction = direction * action_mask.view(mask_shape).to(direction.dtype)
+        norm = torch.linalg.vector_norm(direction.float()).clamp_min(1e-12)
+        return (direction.float() / norm).to(direction.dtype)
+
+    def _estimate_action_jacobian_spectral_norm(
+        self,
+        noisy_action,
+        action_t,
+        verify_frame_st_id,
+        power_iterations,
+    ):
+        z_t = noisy_action.detach()
+
+        def velocity_fn(action_input):
+            return self._predict_action_velocity_for_contraction(
+                action_input,
+                action_t,
+                verify_frame_st_id,
+            )
+
+        direction = self._normalize_contraction_direction(torch.randn_like(z_t))
+        for _ in range(power_iterations):
+            with torch.enable_grad():
+                _, jvp = torch.autograd.functional.jvp(
+                    velocity_fn,
+                    (z_t,),
+                    (direction,),
+                    create_graph=False,
+                    strict=False,
+                )
+            jvp_norm = torch.linalg.vector_norm(jvp.float()).clamp_min(1e-12)
+            output_direction = (jvp.float() / jvp_norm).to(jvp.dtype)
+
+            with torch.enable_grad():
+                z_var = z_t.detach().requires_grad_(True)
+                velocity = velocity_fn(z_var)
+                vjp = torch.autograd.grad(
+                    velocity,
+                    z_var,
+                    grad_outputs=output_direction,
+                    retain_graph=False,
+                    create_graph=False,
+                    allow_unused=False,
+                )[0]
+            direction = self._normalize_contraction_direction(vjp)
+
+        with torch.enable_grad():
+            _, final_jvp = torch.autograd.functional.jvp(
+                velocity_fn,
+                (z_t,),
+                (direction,),
+                create_graph=False,
+                strict=False,
+            )
+        return float(torch.linalg.vector_norm(final_jvp.float()).detach().cpu())
+
+    def _estimate_action_jacobian_spectral_norm_finite_difference(
+        self,
+        noisy_action,
+        action_t,
+        verify_frame_st_id,
+        num_directions=12,
+        delta=0.02,
+    ):
+        estimates = []
+        with torch.no_grad():
+            for _ in range(num_directions):
+                direction = self._normalize_contraction_direction(
+                    torch.randn_like(noisy_action))
+                velocity_plus = self._predict_action_velocity_for_contraction(
+                    noisy_action + delta * direction,
+                    action_t,
+                    verify_frame_st_id,
+                )
+                velocity_minus = self._predict_action_velocity_for_contraction(
+                    noisy_action - delta * direction,
+                    action_t,
+                    verify_frame_st_id,
+                )
+                directional_derivative = (
+                    velocity_plus.float() - velocity_minus.float()) / (2.0 * delta)
+                estimates.append(float(
+                    torch.linalg.vector_norm(directional_derivative).cpu()))
+        return max(estimates) if estimates else 0.0
+
+    def _local_contraction_output_path(self):
+        return getattr(
+            self.job_config,
+            'local_contraction_analysis_output_path',
+            os.path.join(self.save_root, 'local_contraction_analysis.jsonl'),
+        )
+
+    def _append_local_contraction_record(self, record):
+        output_path = self._local_contraction_output_path()
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        with open(output_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(record, ensure_ascii=False) + '\n')
+
+    def _run_local_contraction_analysis(
+        self,
+        obs,
+        action_model_input,
+        noise,
+        latent_condition,
+        verify_frame_st_id,
+        segment_index,
+        current_sigma,
+        current_action_t,
+        current_pred_velocity,
+        current_verifier_mse,
+        current_verifier_accept,
+    ):
+        if not getattr(self.job_config, 'enable_local_contraction_analysis', False):
+            return []
+        event_count = int(getattr(self, '_local_contraction_event_count', 0))
+        max_events = int(getattr(
+            self.job_config, 'local_contraction_analysis_max_events', 100))
+        if event_count >= max_events:
+            return []
+
+        power_iterations = max(1, int(getattr(
+            self.job_config, 'local_contraction_analysis_power_iterations', 8)))
+        requested_t_values = [float(current_sigma.detach().float().cpu())]
+        requested_t_values.extend(float(value) for value in getattr(
+            self.job_config, 'local_contraction_analysis_extra_t_values', []))
+        unique_t_values = []
+        for value in requested_t_values:
+            value = max(0.0, min(1.0, value))
+            if not any(abs(value - existing) < 1e-6 for existing in unique_t_values):
+                unique_t_values.append(value)
+
+        episode_id = obs.get('analysis_episode_id', -1)
+        step_id = obs.get('analysis_step_id', verify_frame_st_id)
+        task = str(obs.get('analysis_task', 'unknown'))
+        phase = str(obs.get('analysis_phase', 'unknown'))
+        output_path = self._local_contraction_output_path()
+        tensor_dir = os.path.splitext(output_path)[0] + '_tensors'
+        os.makedirs(tensor_dir, exist_ok=True)
+
+        cpu_rng_state = torch.get_rng_state()
+        cuda_rng_state = (
+            torch.cuda.get_rng_state(self.device)
+            if torch.cuda.is_available() else None
+        )
+        sample_ids = []
+        try:
+            for t_index, requested_t in enumerate(unique_t_values):
+                sigma_id = torch.argmin(
+                    (self.action_scheduler.sigmas - requested_t).abs())
+                sigma = self.action_scheduler.sigmas[sigma_id].to(
+                    device=self.device, dtype=action_model_input.dtype)
+                action_t = self.action_scheduler.timesteps[sigma_id].to(self.device)
+                noisy_action = (
+                    (1 - sigma) * action_model_input + sigma * noise).to(self.dtype)
+                is_current_t = abs(
+                    float(sigma.detach().float().cpu())
+                    - float(current_sigma.detach().float().cpu())
+                ) < 1e-6
+
+                method = 'jvp_vjp_power'
+                method_error = None
+                try:
+                    lipschitz = self._estimate_action_jacobian_spectral_norm(
+                        noisy_action,
+                        action_t,
+                        verify_frame_st_id,
+                        power_iterations,
+                    )
+                except RuntimeError as exc:
+                    method = 'finite_difference_fallback'
+                    method_error = f'{type(exc).__name__}: {str(exc)[:500]}'
+                    torch.cuda.empty_cache()
+                    lipschitz = (
+                        self._estimate_action_jacobian_spectral_norm_finite_difference(
+                            noisy_action,
+                            action_t,
+                            verify_frame_st_id,
+                        )
+                    )
+
+                if is_current_t:
+                    pred_velocity = current_pred_velocity.detach()
+                    verifier_mse = float(current_verifier_mse)
+                    verifier_accept = bool(current_verifier_accept)
+                else:
+                    with torch.no_grad():
+                        pred_velocity = self._predict_action_velocity_for_contraction(
+                            noisy_action,
+                            action_t,
+                            verify_frame_st_id,
+                        ).detach()
+                    reference_velocity = noise - action_model_input
+                    verifier_mse = float(torch.mean(
+                        (pred_velocity[:, self.action_mask].float()
+                         - reference_velocity[:, self.action_mask].float()) ** 2
+                    ).cpu())
+                    score_mode = getattr(
+                        self.job_config, 'action_denoise_score_mode', 'mean_mse')
+                    if score_mode == 'semantic_weighted':
+                        _, verifier_accept, _, _ = (
+                            self._compute_action_denoise_semantic_score(
+                                pred_velocity,
+                                reference_velocity,
+                            )
+                        )
+                    else:
+                        threshold = float(getattr(
+                            self.job_config,
+                            'speculative_verifier_threshold',
+                            0.5,
+                        ))
+                        verifier_accept = verifier_mse < threshold
+
+                reference_velocity = noise - action_model_input
+                actual_t = float(sigma.detach().float().cpu())
+                q_value = float((1.0 - actual_t) * lipschitz)
+                contractive = bool(q_value < 1.0)
+                sample_id = (
+                    f'{task}_{episode_id}_{step_id}_{segment_index}_'
+                    f'{event_count}_{t_index}_{time.time_ns()}'
+                )
+                tensor_path = os.path.join(tensor_dir, sample_id + '.pt')
+                torch.save({
+                    'draft_action': action_model_input.detach().cpu(),
+                    'z_t': noisy_action.detach().cpu(),
+                    'latent_condition': latent_condition.detach().cpu(),
+                    't': actual_t,
+                    'model_timestep': float(action_t.detach().float().cpu()),
+                    'pred_velocity': pred_velocity.detach().cpu(),
+                    'reference_velocity': reference_velocity.detach().cpu(),
+                    'noise': noise.detach().cpu(),
+                    'verify_frame_st_id': int(verify_frame_st_id),
+                    'segment_index': int(segment_index),
+                }, tensor_path)
+
+                record = {
+                    'record_type': 'sample',
+                    'sample_id': sample_id,
+                    'episode_id': int(episode_id),
+                    'step_id': int(step_id),
+                    'task': task,
+                    'phase': phase,
+                    'segment_index': int(segment_index),
+                    'verify_frame_st_id': int(verify_frame_st_id),
+                    'requested_t': float(requested_t),
+                    't': actual_t,
+                    'model_timestep': float(action_t.detach().float().cpu()),
+                    'verifier_mse': float(verifier_mse),
+                    'Lx': float(lipschitz),
+                    'q': q_value,
+                    'contractive': contractive,
+                    'verifier_accept': bool(verifier_accept),
+                    'replan_triggered': bool(not verifier_accept),
+                    'oracle_action_mse': None,
+                    'oracle_accept': None,
+                    'episode_success': None,
+                    'estimation_method': method,
+                    'power_iterations': int(power_iterations),
+                    'method_error': method_error,
+                    'tensor_path': tensor_path,
+                    'action_shape': list(action_model_input.shape),
+                    'condition_shape': list(latent_condition.shape),
+                }
+                self._append_local_contraction_record(record)
+                sample_ids.append(sample_id)
+                logger.info(
+                    f"[LocalContraction] sample={sample_id} t={actual_t:.6f} "
+                    f"Lx={lipschitz:.6f} q={q_value:.6f} "
+                    f"contractive={contractive} verifier_mse={verifier_mse:.6f} "
+                    f"method={method}"
+                )
+            self._local_contraction_event_count = event_count + 1
+        finally:
+            torch.set_rng_state(cpu_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state, self.device)
+            torch.cuda.empty_cache()
+        return sample_ids
+
+    def _record_local_contraction_episode_end(self, obs):
+        if not getattr(self.job_config, 'enable_local_contraction_analysis', False):
+            return
+        self._append_local_contraction_record({
+            'record_type': 'episode_end',
+            'episode_id': int(obs.get('analysis_episode_id', -1)),
+            'task': str(obs.get('analysis_task', 'unknown')),
+            'episode_success': bool(obs.get('episode_success', False)),
+            'final_step_id': int(obs.get('analysis_step_id', -1)),
+        })
+
     def _verify_speculative_action_denoise(self, obs):
         real_obs = obs.get('obs', None)
         pred_latent = obs.get('pred_latent', None)
@@ -1844,6 +2173,29 @@ class VA_Server:
             else:
                 raise ValueError(
                     f'Unknown action_denoise_score_mode: {score_mode}. Use mean_mse or semantic_weighted')
+
+            # Measure the exact live verifier input/cache after its decision.
+            # Analysis failures must never alter rollout behavior.
+            if getattr(
+                    self.job_config, 'enable_local_contraction_analysis', False):
+                try:
+                    self._run_local_contraction_analysis(
+                        obs=obs,
+                        action_model_input=action_model_input,
+                        noise=noise,
+                        latent_condition=latent_condition,
+                        verify_frame_st_id=verify_frame_st_id,
+                        segment_index=segment_index,
+                        current_sigma=sigma,
+                        current_action_t=action_t,
+                        current_pred_velocity=pred_velocity,
+                        current_verifier_mse=mean_mse_score,
+                        current_verifier_accept=passed,
+                    )
+                except Exception:
+                    logger.exception(
+                        '[LocalContraction] analysis failed; preserving verifier decision')
+                    torch.cuda.empty_cache()
         finally:
             self._restore_transformer_cache(cache_snapshot)
 
@@ -2252,8 +2604,13 @@ class VA_Server:
         async_prefetch = obs.get('async_prefetch', False)
         compare_action_with_real_obs = obs.get('compare_action_with_real_obs', False)
         speculative_verify = obs.get('speculative_verify', False)
+        local_contraction_episode_end = obs.get(
+            'local_contraction_episode_end', False)
 
-        if reset:
+        if local_contraction_episode_end:
+            self._record_local_contraction_episode_end(obs)
+            return dict()
+        elif reset:
             logger.info(f"******************* Reset server ******************")
             self._reset(prompt=prompt)
             return dict()

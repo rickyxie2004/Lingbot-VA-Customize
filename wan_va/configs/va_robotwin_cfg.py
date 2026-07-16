@@ -10,7 +10,7 @@ va_robotwin_cfg.wan22_pretrained_model_name_or_path = "/mnt/public/xieruiqi/mode
 # va_robotwin_cfg.trained_transformer_path = "/mnt/public/ns-t-te-b905754427352261-427-bk/fs/home/xieruiqi/lingbot-va_0607/train_out/checkpoints/checkpoint_step_9000"
 
 va_robotwin_cfg.attn_window = 72
-va_robotwin_cfg.frame_chunk_size = 2
+va_robotwin_cfg.frame_chunk_size = 4
 va_robotwin_cfg.env_type = 'robotwin_tshape'
 
 va_robotwin_cfg.height = 256
@@ -42,7 +42,7 @@ va_robotwin_cfg.enable_video_branch_action_diversity = False
 va_robotwin_cfg.video_branch_action_diversity_num = 8
 
 # Speculative
-va_robotwin_cfg.enable_speculative_verifier = False
+va_robotwin_cfg.enable_speculative_verifier = True
 va_robotwin_cfg.speculative_frame_chunk_size = 4
 va_robotwin_cfg.speculative_replan_frame_chunk_size = 1
 va_robotwin_cfg.speculative_video_num_inference_steps = 5
@@ -64,7 +64,7 @@ va_robotwin_cfg.speculative_oracle_parallel_action_children_per_video = 2
 # IF action_denoise mode
 va_robotwin_cfg.speculative_verifier_action_noise_sigma = 0.3
 va_robotwin_cfg.action_denoise_score_mode = "semantic_weighted"  # mean_mse or semantic_weighted
-va_robotwin_cfg.action_denoise_semantic_weighted_threshold = 0.8
+va_robotwin_cfg.action_denoise_semantic_weighted_threshold = 0.8  # 0.33?
 va_robotwin_cfg.action_denoise_semantic_position_weight = 0.65
 va_robotwin_cfg.action_denoise_semantic_rotation_weight = 0.20
 va_robotwin_cfg.action_denoise_semantic_gripper_weight = 0.15
@@ -79,6 +79,14 @@ va_robotwin_cfg.speculative_verifier_log_path = "/mnt/public/ns-t-te-b9057544273
 
 va_robotwin_cfg.enable_action_denoise_dim_analysis = False
 va_robotwin_cfg.action_denoise_dim_analysis_log_path = "/mnt/public/ns-t-te-b905754427352261-427-bk/fs/home/xieruiqi/Lingbot-VA-Customize/action_denoise_dim_analysis.jsonl"
+
+# Independent rollout analysis: estimate the local action-field Jacobian norm.
+# This is disabled by default because every sample requires extra model passes.
+va_robotwin_cfg.enable_local_contraction_analysis = False
+va_robotwin_cfg.local_contraction_analysis_max_events = 100
+va_robotwin_cfg.local_contraction_analysis_power_iterations = 8
+va_robotwin_cfg.local_contraction_analysis_extra_t_values = []
+va_robotwin_cfg.local_contraction_analysis_output_path = "/mnt/public/ns-t-te-b905754427352261-427-bk/fs/home/xieruiqi/Lingbot-VA-Customize/local_contraction_analysis.jsonl"
 va_robotwin_cfg.video_branch_action_diversity_log_path = "/mnt/public/ns-t-te-b905754427352261-427-bk/fs/home/xieruiqi/Lingbot-VA-Customize/video_branch_action_diversity.txt"
 va_robotwin_cfg.reset_policy_at_half_eval_steps = False
 
